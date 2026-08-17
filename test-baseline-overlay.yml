@@ -1,0 +1,9 @@
+# Baseline overlay: DO NOT touch session persistence (keep JSONL).
+# Only change the port so it can run alongside the 3088 deployment.
+# Purpose: isolate whether "unsupported Unicode escape sequence" is caused
+# by the PostgreSQL plugin or is a pre-existing environment issue.
+
+- id: webserver
+  config:
+    host: 0.0.0.0
+    port: 3081

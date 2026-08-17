@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "strict": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "lib",
+    "declarationDir": "lib/types",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUncheckedIndexedAccess": false,
+    "resolveJsonModule": true,
+    "types": ["node"],
+    "paths": {
+      "@deepseek-ai/dsh-session-persistence": ["/home/weisanju/gitrepos/deepseek-harness/packages/session/session-persistence/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-session-persistence/coordinator": ["/home/weisanju/gitrepos/deepseek-harness/packages/session/session-persistence/lib/types/coordinator.d.ts"],
+      "@deepseek-ai/dsh-session-persistence/revision": ["/home/weisanju/gitrepos/deepseek-harness/packages/session/session-persistence/lib/types/revision.d.ts"],
+      "@deepseek-ai/dsh-session-persistence/preparations": ["/home/weisanju/gitrepos/deepseek-harness/packages/session/session-persistence/lib/types/preparations.d.ts"],
+      "@deepseek-ai/dsh-session-persistence/write-behind": ["/home/weisanju/gitrepos/deepseek-harness/packages/session/session-persistence/lib/types/write-behind.d.ts"],
+      "@deepseek-ai/dsh-session": ["/home/weisanju/gitrepos/deepseek-harness/packages/core/session/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-invariants": ["/home/weisanju/gitrepos/deepseek-harness/packages/runtime-diagnostics/invariants/lib/types/index.d.ts"],
+      "@deepseek-ai/cordis": ["/home/weisanju/gitrepos/deepseek-harness/vendor/cordis/lib/types/index.d.ts"],
+      "@deepseek-ai/schemastery": ["/home/weisanju/gitrepos/deepseek-harness/vendor/schemastery/lib/types/index.d.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["lib", "node_modules", "tests"]
+}

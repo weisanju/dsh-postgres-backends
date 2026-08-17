@@ -1,0 +1,22 @@
+# Test overlay: swap JSONL for PostgreSQL, different port so it doesn't conflict
+# with the running web instance. Usage:
+#   dsh --profile web --patch test-pg-overlay.yml --dump-config   # verify config only
+#   dsh --profile web --patch test-pg-overlay.yml                 # boot test instance
+
+- id: webserver
+  config:
+    host: 0.0.0.0
+    port: 3081
+
+- id: session-persistence-jsonl
+  disabled: true
+
+- insert:
+    - id: session-persistence-postgres
+      name: 'dsh-session-persistence-postgres'
+      config:
+        host: localhost
+        port: 5432
+        user: postgres
+        password: postgres
+        database: postgres

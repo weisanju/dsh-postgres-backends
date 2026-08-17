@@ -101,7 +101,8 @@ function toInt(value: unknown): number {
  *
  * Escape scheme (bijective, applied per string value before JSON encoding):
  *   - U+0000            → the 6-char literal `\u0000`
- *   - literal `\u0000`  → the 8-char literal `\\u0000`
+ *   - literal `\u0000`  → the 7-char literal `\\u0000`
+ * Object **keys** are escaped with the same scheme (PG rejects NUL there too).
  * `unescapeNulText` inverts both in one pass, so an original literal
  * `\u0000` cannot be confused with an escaped NUL.
  */
@@ -126,7 +127,10 @@ export function escapeNulText(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(escapeNulText)
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {}
-    for (const [key, item] of Object.entries(value)) out[key] = escapeNulText(item)
+    for (const [key, item] of Object.entries(value)) {
+      // Keys too: PG text/JSONB reject NUL anywhere, including object keys.
+      out[String(escapeNulText(key))] = escapeNulText(item)
+    }
     return out
   }
   return value
@@ -155,7 +159,9 @@ export function unescapeNulText(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(unescapeNulText)
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {}
-    for (const [key, item] of Object.entries(value)) out[key] = unescapeNulText(item)
+    for (const [key, item] of Object.entries(value)) {
+      out[String(unescapeNulText(key))] = unescapeNulText(item)
+    }
     return out
   }
   return value

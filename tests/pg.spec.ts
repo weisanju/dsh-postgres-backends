@@ -6,6 +6,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SessionStore from '@deepseek-ai/dsh-session'
 import { PostgresSessionPersistence, type Config } from '../src/index.ts'
+import { escapeNulText, unescapeNulText } from '../src/schema.ts'
 import { randomUUID } from 'node:crypto'
 
 const CONNECTION_STRING = 'postgres://postgres:postgres@localhost:5432/postgres'
@@ -186,4 +187,153 @@ describe('PostgresSessionPersistence', () => {
     await dispose()
     // If dispose did not throw, the pool was closed cleanly
   }, 10000)
+})
+
+describe('escapeNulText / unescapeNulText', () => {
+  it('round-trips NUL in object keys and values', () => {
+    const input = {
+      '.\u0000AGENTS.md': {
+        '.\u0000CLAUDE.md': '.\u0000value',
+        'plain-key': 'plain',
+      },
+      'literal \\u0000 key': 'literal \\u0000 value',
+    }
+    const escaped = escapeNulText(input) as typeof input
+    expect(JSON.stringify(escaped)).not.toContain('\u0000')
+    const restored = unescapeNulText(escaped)
+    expect(restored).toEqual(input)
+    // Escaped keys are legal JSON object keys and survive JSON.parse.
+    expect(JSON.parse(JSON.stringify(escaped))).toEqual(escaped)
+  })
+
+  it('is bijective on a mixed adversarial corpus', () => {
+    const corpus = [
+      'plain',
+      '\u0000',
+      '\\u0000',
+      '\\\\u0000',
+      'a\u0000b\\u0000c\\\\u0000d',
+      '.\u0000AGENTS.md',
+      'C:\\temp\u0000\\file',
+      '\\',
+      '\u0000\u0000\u0000',
+    ]
+    for (const s of corpus) {
+      const round = unescapeNulText(escapeNulText(s))
+      expect(round).toBe(s)
+    }
+  })
+})
+
+describe('PostgresSessionPersistence robustness', () => {
+  beforeEach(resetSchema)
+
+  it('surfaces a foreign-key violation when the sessions row was deleted out of band (no silent heal)', async () => {
+    // If the sessions row is deleted out of band, ON DELETE CASCADE removes the
+    // events too — a silent re-materialize would write a seq gap (N without
+    // 0..N-1), corrupting the log on the next load. The backend must surface
+    // the error so the write-behind retains the batch and a restart re-adopts
+    // from the database cleanly.
+    const { persistence, dispose } = await createBackend()
+    const id = randomUUID() as never
+    const meta = { version: 0, id, createdAt: Date.now() }
+    await persistence.create(meta)
+    await persistence.append(id, [{ type: 'turn/end', seq: 0, time: 1000, data: { turn: 1, reason: { kind: 'completed' } } } as never])
+
+    // Simulate an out-of-band deletion of the sessions row (CASCADE empties events too).
+    const { Pool } = await import('pg')
+    const pool = new Pool({ connectionString: CONNECTION_STRING })
+    await pool.query('DELETE FROM sessions WHERE id = $1', [id])
+    await pool.end()
+
+    // Coordinator still believes the session exists (materialized): append must
+    // reject with the FK error, not invent a corrupt gap.
+    await expect(
+      persistence.append(id, [{ type: 'turn/end', seq: 1, time: 2000, data: { turn: 2, reason: { kind: 'completed' } } } as never]),
+    ).rejects.toMatchObject({ code: '23503' })
+    await dispose()
+  })
+
+  it('does not retry for non-FK failures (e.g. duplicate seq)', async () => {
+    const { persistence, dispose } = await createBackend()
+    const id = randomUUID() as never
+    await persistence.create({ version: 0, id, createdAt: Date.now() })
+    await persistence.append(id, [{ type: 'turn/end', seq: 0, time: 1000, data: { turn: 1, reason: { kind: 'completed' } } } as never])
+    // A second append with an overlapping seq is a primary-key violation (23505),
+    // NOT a foreign-key violation — the coordinator rejects it before reaching the
+    // backend; force it by calling appendBatch directly with isMaterialized=true.
+    await expect(
+      persistence['appendBatch' as never](
+        { version: 0, id, createdAt: Date.now() } as never,
+        [{ type: 'turn/end', seq: 0, time: 1000, data: { turn: 1, reason: { kind: 'completed' } } } as never],
+        true,
+      ) as never,
+    ).rejects.toThrow()
+    await dispose()
+  })
+
+  it('round-trips NUL bytes in synthetic closers through commitRepair', async () => {
+    const { persistence, dispose } = await createBackend()
+    const id = randomUUID() as never
+    await persistence.create({ version: 0, id, createdAt: Date.now() })
+    await persistence.append(id, [
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+    ] as never[])
+
+    // Synthetic closers from interruptedTurnClosers are plain, but future shapes
+    // may carry payload; commitRepair must use the same NUL-safe encoding.
+    const closers = [
+      {
+        type: 'user/message', seq: 1, time: 1000,
+        data: {
+          id: `msg-${randomUUID()}`,
+          role: 'user',
+          source: { kind: 'user' },
+          content: [{ type: 'text', text: 'scope \u0000 stays literal \\u0000' }],
+        },
+        surfaceOp: 'append',
+      },
+      { type: 'turn/end', seq: 2, time: 1000, data: { turn: 1, reason: { kind: 'interrupted' } } },
+    ] as never[]
+    await persistence['commitRepair' as never](
+      { version: 0, id, createdAt: Date.now() } as never,
+      1,
+      closers,
+    ) as never
+
+    const inspection = await persistence.load(id)
+    expect(inspection.events).toHaveLength(3)
+    const msg = inspection.events[1] as { data: { content: Array<{ text: string }> } }
+    expect(msg.data.content[0]?.text).toBe('scope \u0000 stays literal \\u0000')
+    await dispose()
+  })
+
+  it('appends a large batch in one multi-row INSERT without losing events', async () => {
+    const { persistence, dispose } = await createBackend()
+    const id = randomUUID() as never
+    await persistence.create({ version: 0, id, createdAt: Date.now() })
+    const n = 2000
+    const events = [
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+      {
+        type: 'user/message', seq: 1, time: 1001,
+        data: { id: `msg-${randomUUID()}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'go' }] },
+        surfaceOp: 'append',
+      },
+      ...Array.from({ length: n - 3 }, (_, i) => ({
+        type: 'assistant/chunk' as const,
+        seq: i + 2,
+        time: 1002 + i,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: `.\u0000AGENTS.md-${i}` } },
+      })),
+      { type: 'turn/end', seq: n - 1, time: 2000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ] as never[]
+    await persistence.append(id, events)
+    const inspection = await persistence.load(id)
+    expect(inspection.events).toHaveLength(n)
+    expect(inspection.events[n - 1]?.seq).toBe(n - 1)
+    const chunk = inspection.events[n - 2] as { data: { chunk: { text: string } } }
+    expect(chunk.data.chunk.text).toBe(`.\u0000AGENTS.md-${n - 4}`)
+    await dispose()
+  })
 })

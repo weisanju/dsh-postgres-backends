@@ -47,6 +47,14 @@ export interface Config {
   password?: string
   /** PostgreSQL database name (used when connectionString is not provided). */
   database?: string
+  /** Maximum number of clients the pool holds. Default: 10 (pg default). */
+  poolMax?: number
+  /**
+   * Milliseconds to wait for a connection before failing; 0 waits forever.
+   * Default: 0 (pg default). Set a finite value so a hung PostgreSQL cannot
+   * stall `connect()` indefinitely.
+   */
+  connectionTimeoutMillis?: number
   /**
    * Maximum number of prepared session preparations retained for
    * history-to-resume reuse.
@@ -73,6 +81,8 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
     user: z.string().default('postgres'),
     password: z.string().default('postgres'),
     database: z.string().default('postgres'),
+    poolMax: z.number().step(1).min(1).default(10),
+    connectionTimeoutMillis: z.number().step(1).min(0).default(0),
     preparedSessionCacheSize: z.number().step(1).min(1).default(DEFAULT_PREPARED_SESSION_CACHE_SIZE),
     writeBatchMaxDelayMs: z.number().step(1).min(1).max(MAX_WRITE_BATCH_DELAY_MS)
       .default(DEFAULT_WRITE_BATCH_MAX_DELAY_MS),
@@ -104,18 +114,32 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
   }
 
   private poolConfig(config: Config): pg.PoolConfig {
-    if (config.connectionString) return { connectionString: config.connectionString }
+    const base = config.connectionString
+      ? { connectionString: config.connectionString }
+      : {
+          host: config.host ?? 'localhost',
+          port: config.port ?? 5432,
+          user: config.user,
+          password: config.password,
+          database: config.database,
+        }
     return {
-      host: config.host ?? 'localhost',
-      port: config.port ?? 5432,
-      user: config.user,
-      password: config.password,
-      database: config.database,
+      ...base,
+      max: config.poolMax ?? 10,
+      connectionTimeoutMillis: config.connectionTimeoutMillis ?? 0,
     }
   }
 
   private async openDb(config: Config): Promise<void> {
     this.pool = new Pool(this.poolConfig(config))
+    // pg-pool emits 'error' when an IDLE client is dropped (server restart,
+    // reboot, network partition). Without a listener Node treats the emitted
+    // 'error' as an uncaught exception and crashes the whole process — see
+    // pg-pool README "events -> error". Log and keep serving: the pool will
+    // heal itself by creating fresh connections for the next acquire.
+    this.pool.on('error', (error: Error) => {
+      this.ctx.logger.warn('[session-persistence-postgres] idle pool client error: %s', error.message)
+    })
     const client = await this.pool.connect()
     try {
       // One advisory-lock-scoped transaction: validate or initialize the schema
@@ -228,6 +252,18 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
    * Durably append a batch in ONE transaction: materialize the sessions row (if
    * lazy) and INSERT every event, or roll back entirely. The transaction is the
    * atomicity + durability boundary.
+   *
+   * Events are inserted with a single multi-row `INSERT ... VALUES (...),...`
+   * so a large batch costs one round trip instead of N.
+   *
+   * A foreign-key violation (23503) means the sessions row was deleted
+   * out-of-band (with `ON DELETE CASCADE` the events are gone too). We do NOT
+   * re-materialize and retry: this sessions table's rows are managed exclusively
+   * by this backend, and once the row+log were deleted externally the in-memory
+   * cursor is stale — a retry would write a gap (seq N without 0..N-1) that
+   * makes the log corrupt on the next load. Instead surface the error: the
+   * write-behind retains the batch and reports it, and a restart re-adopts from
+   * the database cleanly.
    */
   async appendBatch(meta: SessionHeader, events: readonly SessionEvent[], isMaterialized: boolean): Promise<void> {
     await this.ready
@@ -235,12 +271,24 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
     try {
       await client.query('BEGIN')
       if (!isMaterialized) await this.writeRow(client, meta)
-      for (const event of events) {
-        const [surfaceSeqs, surfaceOp, ignorable] = envelopeBindings(event)
+      if (events.length > 0) {
+        // One multi-row INSERT for the whole batch (8 bindings per event).
+        const rows = events.map((_, i) => {
+          const base = i * 8
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb, $${base + 8})`
+        }).join(', ')
+        const values: unknown[] = []
+        for (const event of events) {
+          const [surfaceSeqs, surfaceOp, ignorable] = envelopeBindings(event)
+          values.push(
+            meta.id, event.seq, event.type, event.time,
+            JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp, ignorable,
+          )
+        }
         await client.query(
           `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
-           VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8)`,
-          [meta.id, event.seq, event.type, event.time, JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp, ignorable],
+           VALUES ${rows}`,
+          values,
         )
       }
       await client.query('UPDATE sessions SET revision = revision + 1 WHERE id = $1', [meta.id])
@@ -267,14 +315,26 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
         await client.query('DELETE FROM events WHERE session_id = $1 AND seq >= $2', [meta.id, tornMarker])
       }
       if (closers.length > 0) {
+        // Same NUL-safe JSONB encoding as appendBatch, so synthetic closers can
+        // never hit `22P05 unsupported Unicode escape sequence` if their shape
+        // ever carries user-supplied payload.
+        const rows = closers.map((_, i) => {
+          const base = i * 8
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb, $${base + 8})`
+        }).join(', ')
+        const values: unknown[] = []
         for (const event of closers) {
           const [surfaceSeqs, surfaceOp, ignorable] = envelopeBindings(event)
-          await client.query(
-            `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8)`,
-            [meta.id, event.seq, event.type, event.time, JSON.stringify(event.data), surfaceSeqs, surfaceOp, ignorable],
+          values.push(
+            meta.id, event.seq, event.type, event.time,
+            JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp, ignorable,
           )
         }
+        await client.query(
+          `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
+           VALUES ${rows}`,
+          values,
+        )
       }
       if (tornMarker !== undefined || closers.length > 0) {
         await client.query('UPDATE sessions SET revision = revision + 1 WHERE id = $1', [meta.id])
@@ -313,17 +373,40 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
 
   // --- helpers ---
 
-  /** Read a session's row + ordered events into a StoredPrefix. */
+  /**
+   * Read a session's row + ordered events into a StoredPrefix, under one
+   * READ-ONLY REPEATABLE READ transaction so `row` and `events` come from the
+   * same committed snapshot (mirrors the SQLite backend's BEGIN/COMMIT read).
+   */
   private async readPrefix(id: SessionId): Promise<StoredPrefix<number> | undefined> {
-    const row = await this.rowFor(id)
-    if (row === undefined) return undefined
-    const eventRows = await this.eventRowsFor(id)
-    const { preserved, tornFrom } = scanRows(eventRows)
-    return {
-      meta: rowToMeta(row),
-      events: preserved,
-      revision: this.revisionFor(row),
-      ...tornFrom !== undefined ? { tornMarker: tornFrom } : {},
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+      const rowResult = await client.query<SessionRow>('SELECT * FROM sessions WHERE id = $1', [id])
+      const row = rowResult.rows[0]
+      if (row === undefined) {
+        await client.query('COMMIT')
+        return undefined
+      }
+      const eventResult = await client.query<EventRow>(
+        `SELECT seq, type, time, data::text AS data, source_event_seqs::text AS source_event_seqs,
+                surface_op::text AS surface_op, ignorable
+         FROM events WHERE session_id = $1 ORDER BY seq`,
+        [id],
+      )
+      await client.query('COMMIT')
+      const { preserved, tornFrom } = scanRows(eventResult.rows)
+      return {
+        meta: rowToMeta(row),
+        events: preserved,
+        revision: this.revisionFor(row),
+        ...tornFrom !== undefined ? { tornMarker: tornFrom } : {},
+      }
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
     }
   }
 

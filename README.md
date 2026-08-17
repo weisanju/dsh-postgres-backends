@@ -48,7 +48,10 @@ cd <deepseek-harness-checkout> && pnpm dsh web --patch local-overlay.yml
 
 | 键 | 必填 | 默认 | 说明 |
 |----|------|------|------|
-| `connectionString` | 是 | — | PG 连接串（`postgres://user:pass@host:port/db`） |
+| `connectionString` | 否 | — | PG 连接串（`postgres://user:pass@host:port/db`）；不填则用下方 host/port/user/password/database |
+| `host` / `port` / `user` / `password` / `database` | 否 | localhost / 5432 / postgres / postgres / postgres | 独立连接参数（未提供 `connectionString` 时使用） |
+| `poolMax` | 否 | 10 | 连接池最大客户端数 |
+| `connectionTimeoutMillis` | 否 | 0 | 取连接超时（毫秒）；0 = 无限等待（pg 默认）。建议设有限值，避免 PG 挂起时 `connect()` 无限阻塞 |
 | `preparedSessionCacheSize` | 否 | 5 | 保留的冷会话准备数 |
 | `writeBatchMaxDelayMs` | 否 | 200 | 批量写入合并窗口 |
 | `schema` | 否 | 当前用户 | 表所在 schema |
@@ -96,12 +99,23 @@ JSONL 文件后端能原样存储；但 PostgreSQL 的 `text`/`JSONB` **不允�
 
 因此本插件在 JSONB 边界做**双层转义**（不影响 DSH 本体）：
 
-- 写入：真实 NUL → 6 字符字面量 `\u0000`；原文字面量 `\u0000` → 8 字符 `\\u0000`
-  （防止解码时把用户原本的 `\u0000` 文本误还原成 NUL）
+- 写入：真实 NUL → 6 字符字面量 `\u0000`；原文字面量 `\u0000` → 7 字符 `\\u0000`
+  （防止解码时把用户原本的 `\u0000` 文本误还原成 NUL）；对象**键**同样转义
 - 读出：`rowToEvent` 里反向还原（`\\u0000` → 原样，`\u0000` → 真实 NUL）
 
 实现见 `src/schema.ts` 的 `escapeNulText` / `unescapeNulText`，测试见
 `tests/pg.spec.ts` 的 "round-trips NUL bytes" 用例。
+
+## 已知边界
+
+- **`events_session_id_fkey`（外键违规）**：`events.session_id → sessions(id) ON DELETE CASCADE`。
+  正常写入顺序安全（`appendBatch` 在同一事务先物化 `sessions` 行再插 `events`）。若
+  `sessions` 行被**外部删除**（手动 `DELETE`/`TRUNCATE`），CASCADE 会连带清空该会话的
+  events，此时`appendBatch` 报 `23503 foreign_key_violation` 上抛（不静默自愈——自愈
+  补行会留下 seq 空洞，导致下次 `load` 报 corrupt）。处理：清库时连 events 一起清，
+  并**重启实例**让协调器重新从库 adopt。
+- **连接中断**：空闲连接被 PG 断开（重启/网络分区）时 pooled client 报错，进程不会崩溃
+  （`pool.on('error')` 只记日志），下一个 `acquire` 自动新建连接自愈。
 
 ## 开发
 

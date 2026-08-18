@@ -148,6 +148,8 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
       await client.query('BEGIN')
       try {
         await client.query(DDL)
+        // Schema v1 → v2: drop the unused `ignorable` column from events.
+        await client.query('ALTER TABLE events DROP COLUMN IF EXISTS ignorable')
         const state = await client.query<{ store_id: string; schema_version: number | null }>(
           'SELECT store_id, schema_version FROM persistence_state WHERE singleton = 1',
         )
@@ -272,28 +274,28 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
       await client.query('BEGIN')
       if (!isMaterialized) await this.writeRow(client, meta)
       if (events.length > 0) {
-        // Multi-row INSERT with 8 bindings per event; the PostgreSQL wire
+        // Multi-row INSERT with 7 bindings per event; the PostgreSQL wire
         // protocol caps a bind message at 65535 parameters, so a batch with
-        // more than ~8000 events (64k bindings) must be chunked. Chunks stay
+        // more than ~9000 events (64k bindings) must be chunked. Chunks stay
         // inside one transaction: a mid-way failure rolls the whole batch
         // back, preserving the append-only / contiguous-seq contract.
         const BINDING_CHUNK = 4000
         for (let offset = 0; offset < events.length; offset += BINDING_CHUNK) {
           const chunk = events.slice(offset, offset + BINDING_CHUNK)
           const rows = chunk.map((_, i) => {
-            const base = i * 8
-            return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb, $${base + 8})`
+            const base = i * 7
+            return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb)`
           }).join(', ')
           const values: unknown[] = []
           for (const event of chunk) {
-            const [surfaceSeqs, surfaceOp, ignorable] = envelopeBindings(event)
+            const [surfaceSeqs, surfaceOp] = envelopeBindings(event)
             values.push(
               meta.id, event.seq, event.type, event.time,
-              JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp, ignorable,
+              JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp,
             )
           }
           await client.query(
-            `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
+            `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op)
              VALUES ${rows}`,
             values,
           )
@@ -327,19 +329,19 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
         // never hit `22P05 unsupported Unicode escape sequence` if their shape
         // ever carries user-supplied payload.
         const rows = closers.map((_, i) => {
-          const base = i * 8
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb, $${base + 8})`
+          const base = i * 7
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb)`
         }).join(', ')
         const values: unknown[] = []
         for (const event of closers) {
-          const [surfaceSeqs, surfaceOp, ignorable] = envelopeBindings(event)
+          const [surfaceSeqs, surfaceOp] = envelopeBindings(event)
           values.push(
             meta.id, event.seq, event.type, event.time,
-            JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp, ignorable,
+            JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp,
           )
         }
         await client.query(
-          `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
+          `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op)
            VALUES ${rows}`,
           values,
         )
@@ -410,7 +412,7 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
       }
       const eventResult = await client.query<EventRow>(
         `SELECT seq, type, time, data::text AS data, source_event_seqs::text AS source_event_seqs,
-                surface_op::text AS surface_op, ignorable
+                surface_op::text AS surface_op
          FROM events WHERE session_id = $1 ORDER BY seq`,
         [id],
       )
@@ -452,7 +454,7 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
   private async eventRowsFor(id: SessionId, where = 'TRUE'): Promise<EventRow[]> {
     const result = await this.pool.query<EventRow>(
       `SELECT seq, type, time, data::text AS data, source_event_seqs::text AS source_event_seqs,
-              surface_op::text AS surface_op, ignorable
+              surface_op::text AS surface_op
        FROM events WHERE session_id = $1 AND ${where} ORDER BY seq`,
       [id],
     )

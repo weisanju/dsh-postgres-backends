@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS events (
   data              JSONB NOT NULL,
   source_event_seqs JSONB,
   surface_op        JSONB,
-  ignorable         INTEGER,
   PRIMARY KEY (session_id, seq)
 );
 `
@@ -78,8 +77,6 @@ export interface EventRow {
   source_event_seqs: string | null
   /** JSON-encoded SurfaceOp — how the event entered the surface, or null. */
   surface_op: string | null
-  /** 1 iff the event carries the envelope's `ignorable: true` marker, else null. */
-  ignorable: number | null
 }
 
 /** pg returns BIGINT as string — normalize to a JS safe integer. */
@@ -199,14 +196,12 @@ export function rowToEvent(row: EventRow): SessionEvent {
     ...row.source_event_seqs !== null ? { sourceEventSeqs: JSON.parse(row.source_event_seqs) as number[] } : {},
     ...row.surface_op !== null ? { surfaceOp: JSON.parse(row.surface_op) as SurfaceOp } : {},
   }
-  const ignorableField = row.ignorable === 1 ? { ignorable: true as const } : {}
   return {
     type: row.type as SessionEvent['type'],
     seq: toInt(row.seq),
     time: toInt(row.time),
     data: unescapeNulText(JSON.parse(row.data)) as SessionEvent['data'],
     ...surfaceFields,
-    ...ignorableField,
   } as SessionEvent
 }
 
@@ -257,15 +252,12 @@ export function scanRows(rows: readonly EventRow[], base = 0): { preserved: Sess
 
 /**
  * Serialize an event's optional envelope fields for PG binding. The surface
- * fields are nullable JSONB — null when the event has no surface metadata;
- * the ignorable marker is a nullable INTEGER column — 1 iff the envelope
- * carries `ignorable: true`.
+ * fields are nullable JSONB — null when the event has no surface metadata.
  */
-export function envelopeBindings(event: SessionEvent): [string | null, string | null, number | null] {
+export function envelopeBindings(event: SessionEvent): [string | null, string | null] {
   const se = event as SessionEvent & { surfaceOp?: unknown; sourceEventSeqs?: unknown }
   return [
     se.sourceEventSeqs !== undefined ? JSON.stringify(se.sourceEventSeqs) : null,
     se.surfaceOp !== undefined ? JSON.stringify(se.surfaceOp) : null,
-    (event as { ignorable?: boolean }).ignorable === true ? 1 : null,
   ]
 }

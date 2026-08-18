@@ -1,8 +1,8 @@
 /**
  * PG console — host half. Registers the `/pg-console/api` HTTP surface
  * (connection test/save + bidirectional session migration between the
- * official JSONL backend and this package's PostgreSQL backend) and a
- * `pg-backends` settings namespace for the connection form.
+ * official JSONL backend and this package's PostgreSQL backend). The
+ * connection form values persist in `~/.dsh/pg-console.json`.
  *
  * Design notes:
  * - Both backends are constructed on `ctx.isolate('sessionPersistence')`
@@ -28,11 +28,7 @@ import { PostgresSessionPersistence } from '../index.ts'
 import { SessionId, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import {
   API_ROOT,
-  DEFAULT_AUTO_SYNC,
   DEFAULT_CONNECTION,
-  SETTINGS_NAMESPACE,
-  type AutoSyncConfig,
-  type AutoSyncStatus,
   type ConsoleApi,
   type ConnectionTestResult,
   type MigrationConflictPolicy,
@@ -342,14 +338,14 @@ function writeJson(
  * The console host plugin body. Depends on sessions (isolated backends) and
  * webServer (API routes).
  *
- * Persistence note: connection + auto-sync settings live in a dedicated JSON
- * file (`~/.dsh/pg-console.json`), NOT in the DSH settings document. The
+ * Persistence note: connection settings live in a dedicated JSON file
+ * (`~/.dsh/pg-console.json`), NOT in the DSH settings document. The
  * settings.yaml top-level is merged into every cordis plugin's config, so a
- * `pg-backends` namespace block there (even partial, e.g. only the auto-sync
- * toggle) corrupts the mounted PostgreSQL backend's plugin config (password
- * becomes undefined and `pg.Pool` dies with "client password must be a
- * string"). Keeping console state out of the settings document avoids the
- * hazard entirely; the password file is user-owned and mode-0600.
+ * `pg-backends` namespace block there corrupts the mounted PostgreSQL
+ * backend's plugin config (password becomes undefined and `pg.Pool` dies
+ * with "client password must be a string"). Keeping console state out of
+ * the settings document avoids the hazard entirely; the password file is
+ * user-owned and mode-0600.
  */
 export function apply(ctx: Context): void {
   ctx.inject(['sessions'], async (sctx) => {
@@ -358,7 +354,6 @@ export function apply(ctx: Context): void {
 
     interface StoreDoc {
       config?: PgConnectionConfig
-      autoSync?: AutoSyncConfig
     }
 
     let store: StoreDoc = {}
@@ -394,76 +389,7 @@ export function apply(ctx: Context): void {
       connectionTimeoutMillis: Number(store.config?.connectionTimeoutMillis ?? DEFAULT_CONNECTION.connectionTimeoutMillis),
     })
 
-    /** Saved auto-sync config (always materialized, defaults when unset). */
-    const savedAutoSync = (): AutoSyncConfig => ({
-      enabled: Boolean(store.autoSync?.enabled ?? DEFAULT_AUTO_SYNC.enabled),
-      intervalMinutes: Number(store.autoSync?.intervalMinutes ?? DEFAULT_AUTO_SYNC.intervalMinutes),
-    })
-
-    /** Transient auto-sync state (memory-only; lost on restart, that's fine). */
-    const autoSync: AutoSyncStatus = {
-      armed: false,
-      intervalMinutes: DEFAULT_AUTO_SYNC.intervalMinutes,
-    }
-    let autoSyncInFlight = false
-    let autoSyncTimer: ReturnType<typeof setInterval> | undefined
-
-    /** One JSONL → PG incremental run, guarded against overlap. */
-    const runAutoSync = async (): Promise<AutoSyncStatus> => {
-      if (autoSyncInFlight) {
-        autoSync.skippedOverlap = true
-        return autoSync
-      }
-      autoSyncInFlight = true
-      autoSync.lastRunAt = Date.now()
-      try {
-        const config = savedConfig()
-        if (config.host === '' || config.user === '') {
-          autoSync.lastError = 'connection config is incomplete; auto sync disabled until saved'
-          return autoSync
-        }
-        autoSync.lastError = undefined
-        autoSync.lastResult = await migrate(sctx, 'jsonl-to-pg', config, false, 'skip')
-      } catch (error) {
-        autoSync.lastError = error instanceof Error ? error.message : String(error)
-        autoSync.lastResult = undefined
-      } finally {
-        autoSync.lastFinishedAt = Date.now()
-        autoSyncInFlight = false
-      }
-      return autoSync
-    }
-
-    /** (Re)arm or disarm the interval based on the current saved config. */
-    const armAutoSync = (): void => {
-      const cfg = savedAutoSync()
-      autoSync.intervalMinutes = cfg.intervalMinutes
-      autoSync.armed = cfg.enabled && cfg.intervalMinutes >= 1
-      if (autoSyncTimer !== undefined) {
-        clearInterval(autoSyncTimer)
-        autoSyncTimer = undefined
-      }
-      if (autoSync.armed) {
-        const ms = Math.max(60_000, cfg.intervalMinutes * 60_000)
-        // Kick one run shortly after (re)arming so the copy converges soon;
-        // the interval then keeps it fresh. Re-arms (after settings save)
-        // also kick, so an enable + save converges immediately.
-        const first = setTimeout(() => { void runAutoSync() }, 3000)
-        first.unref?.()
-        autoSyncTimer = setInterval(() => { void runAutoSync() }, ms)
-      }
-    }
-
     await loadStore()
-    armAutoSync()
-
-    // Clear the interval when this plugin's scope is torn down.
-    ;(sctx as { effect?: <T>(cb: () => T | (() => void), name?: string) => void }).effect?.(() => () => {
-      if (autoSyncTimer !== undefined) {
-        clearInterval(autoSyncTimer)
-        autoSyncTimer = undefined
-      }
-    }, 'dsh-postgres-backends: auto-sync timer')
 
     const api: ConsoleApi = {
       'connection.test': async req => testConnection(sctx, req.config),
@@ -475,7 +401,6 @@ export function apply(ctx: Context): void {
       'connection.save': async req => {
         store = { ...store, config: req.config }
         await saveStore()
-        armAutoSync() // connection may have been blank this whole time
         return { saved: true }
       },
       'migrate.start': async req => {
@@ -485,15 +410,6 @@ export function apply(ctx: Context): void {
         }
         return migrate(sctx, req.direction, config, req.dryRun, req.onConflict ?? 'skip')
       },
-      'autosync.set': async req => {
-        const cfg = req.config
-        store = { ...store, autoSync: { enabled: cfg.enabled, intervalMinutes: Math.max(1, Math.round(cfg.intervalMinutes)) } }
-        await saveStore()
-        armAutoSync()
-        return { saved: true }
-      },
-      'autosync.get': async () => ({ config: savedAutoSync() }),
-      'autosync.status': async () => ({ ...autoSync }),
     }
 
     sctx.inject(['webServer', 'webRuntime'], (wctx) => {
@@ -542,7 +458,6 @@ export default apply
 /** Context surface this console consumes (provided by the host bundles). */
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    settings: import('@deepseek-ai/dsh-settings').SettingsProvider
     webServer: import('@deepseek-ai/dsh-host-webserver').WebServer
     webRuntime?: { trustedHosts: readonly string[] }
   }

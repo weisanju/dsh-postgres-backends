@@ -268,3 +268,14 @@
 .warn {
   color: var(--dsw-alias-warning-strong, #b45309);
 }
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.toggle input {
+  accent-color: var(--dsw-alias-button-primary-fill, #4f7cff);
+}

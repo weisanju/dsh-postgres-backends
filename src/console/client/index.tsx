@@ -16,7 +16,10 @@ import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Context } from './context-types.ts'
 import {
   API_ROOT,
+  DEFAULT_AUTO_SYNC,
   DEFAULT_CONNECTION,
+  type AutoSyncConfig,
+  type AutoSyncStatus,
   type ConnectionTestResult,
   type MigrationConflictPolicy,
   type MigrationDirection,
@@ -115,6 +118,9 @@ export function PgConsoleSection(): ReactNode {
   const [report, setReport] = useState<MigrationStartResult | undefined>()
   const [migrateError, setMigrateError] = useState<string | undefined>()
   const [onConflict, setOnConflict] = useState<MigrationConflictPolicy>('skip')
+  const [autoSync, setAutoSync] = useState<AutoSyncConfig>(DEFAULT_AUTO_SYNC)
+  const [autoSyncStatus, setAutoSyncStatus] = useState<AutoSyncStatus | undefined>()
+  const [autoSyncSaving, setAutoSyncSaving] = useState(false)
   const mounted = useRef(true)
 
   useEffect(() => {
@@ -131,6 +137,20 @@ export function PgConsoleSection(): ReactNode {
         if (mounted.current) {
           setSaveError(error instanceof Error ? error.message : String(error))
         }
+      })
+    void call<{ config: AutoSyncConfig }>('autosync.get', {})
+      .then(({ config }) => {
+        if (mounted.current) setAutoSync(config)
+      })
+      .catch(() => {
+        // Best-effort; the toggle stays at its default.
+      })
+    void call<AutoSyncStatus>('autosync.status', {})
+      .then((status) => {
+        if (mounted.current) setAutoSyncStatus(status)
+      })
+      .catch(() => {
+        // Best-effort.
       })
     return () => { mounted.current = false }
   }, [])
@@ -183,6 +203,20 @@ export function PgConsoleSection(): ReactNode {
   }
 
   /** Human-readable conflict policy options. */
+  const saveAutoSync = async (): Promise<void> => {
+    if (autoSyncSaving) return
+    setAutoSyncSaving(true)
+    try {
+      await call<{ saved: boolean }>('autosync.set', { config: autoSync })
+      const status = await call<AutoSyncStatus>('autosync.status', {})
+      if (mounted.current) setAutoSyncStatus(status)
+    } catch (error) {
+      if (mounted.current) setMigrateError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (mounted.current) setAutoSyncSaving(false)
+    }
+  }
+
   const conflictOptions: { value: MigrationConflictPolicy; label: string; hint: string }[] = [
     { value: 'skip', label: '跳过 (skip)', hint: '目标已有 → 不写；目标更多 → 报告差异' },
     { value: 'overwrite', label: '覆盖 (overwrite)', hint: '删除目标整会话，用源重建（仅 PG 为目标时）' },
@@ -296,6 +330,53 @@ export function PgConsoleSection(): ReactNode {
         <div className={styles.groupHeading}>
           会话迁移
           <span className={styles.count}>JSONL ⇄ PostgreSQL（源只读，增量写目标）</span>
+        </div>
+        <div className={styles.row}>
+          <div className={styles.rowText}>
+            <span className={styles.title}>自动增量同步</span>
+            <span className={styles.desc}>
+              周期性运行 JSONL → PostgreSQL 增量迁移，让 PG 副本自动跟上生产侧 JSONL（源只读）。
+              {autoSyncStatus?.lastFinishedAt !== undefined && (
+                <span className={styles.dim}>
+                  {' '}上次运行 {new Date(autoSyncStatus.lastFinishedAt).toLocaleTimeString('zh-CN')}
+                  {autoSyncStatus.lastResult !== undefined
+                    ? ` · 事件 ${fmtCount(autoSyncStatus.lastResult.eventsTotal)}`
+                    : ''}
+                  {autoSyncStatus.lastError !== undefined ? ` · ${autoSyncStatus.lastError}` : ''}
+                </span>
+              )}
+            </span>
+          </div>
+          <div className={styles.rowActions}>
+            <label className={styles.selectWrap}>
+              <select
+                className={styles.select}
+                value={String(autoSync.intervalMinutes)}
+                disabled={autoSyncSaving || !autoSync.enabled}
+                onChange={(e) => setAutoSync({ ...autoSync, intervalMinutes: Number(e.target.value) })}
+              >
+                {[1, 5, 10, 30, 60].map((m) => (
+                  <option key={m} value={String(m)}>每 {m} 分钟</option>
+                ))}
+              </select>
+            </label>
+            <button
+              className={styles.btn}
+              disabled={autoSyncSaving}
+              onClick={() => void saveAutoSync()}
+            >
+              保存
+            </button>
+            <label className={styles.toggle}>
+              <input
+                type="checkbox"
+                checked={autoSync.enabled}
+                disabled={autoSyncSaving}
+                onChange={(e) => setAutoSync({ ...autoSync, enabled: e.target.checked })}
+              />
+              <span className={styles.dim}>{autoSync.enabled ? '已开启' : '已关闭'}</span>
+            </label>
+          </div>
         </div>
         <div className={styles.row}>
           <div className={styles.rowText}>

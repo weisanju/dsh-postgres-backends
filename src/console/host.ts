@@ -20,17 +20,19 @@
  */
 
 import { Context } from '@deepseek-ai/cordis'
-import z from '@deepseek-ai/schemastery'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { JsonlSessionPersistence } from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { PostgresSessionPersistence } from '../index.ts'
 import { SessionId, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import {
   API_ROOT,
+  DEFAULT_AUTO_SYNC,
   DEFAULT_CONNECTION,
   SETTINGS_NAMESPACE,
+  type AutoSyncConfig,
+  type AutoSyncStatus,
   type ConsoleApi,
   type ConnectionTestResult,
   type MigrationConflictPolicy,
@@ -58,7 +60,10 @@ function isolatedPgBackend(ctx: Context, config: PgConnectionConfig): PostgresSe
     host: config.host,
     port: config.port,
     user: config.user,
-    password: config.password,
+    // A blank stored password means "not configured yet" → fall back to the
+    // same default the overlay uses, so an auto-sync run before the form is
+    // saved cannot crash the process with `client password must be a string`.
+    password: config.password === '' ? DEFAULT_CONNECTION.password || 'postgres' : config.password,
     database: config.database,
     poolMax: config.poolMax,
     connectionTimeoutMillis: config.connectionTimeoutMillis,
@@ -333,33 +338,132 @@ function writeJson(
   res.end(text)
 }
 
-/** The console host plugin body. Depends on settings (connection form) and webServer (API routes). */
+/**
+ * The console host plugin body. Depends on sessions (isolated backends) and
+ * webServer (API routes).
+ *
+ * Persistence note: connection + auto-sync settings live in a dedicated JSON
+ * file (`~/.dsh/pg-console.json`), NOT in the DSH settings document. The
+ * settings.yaml top-level is merged into every cordis plugin's config, so a
+ * `pg-backends` namespace block there (even partial, e.g. only the auto-sync
+ * toggle) corrupts the mounted PostgreSQL backend's plugin config (password
+ * becomes undefined and `pg.Pool` dies with "client password must be a
+ * string"). Keeping console state out of the settings document avoids the
+ * hazard entirely; the password file is user-owned and mode-0600.
+ */
 export function apply(ctx: Context): void {
-  ctx.inject(['settings', 'sessions'], (sctx) => {
-    // Settings namespace for the connection form.
-    const settings = sctx.settings.register(settingsNamespace(SETTINGS_NAMESPACE), z.object({
-      host: z.string(),
-      port: z.natural(),
-      user: z.string(),
-      password: z.string(),
-      database: z.string(),
-      poolMax: z.natural(),
-      connectionTimeoutMillis: z.natural(),
-    }))
+  ctx.inject(['sessions'], async (sctx) => {
+    /** Dedicated JSON store on disk (dsh-home; stable across restarts). */
+    const storePath = () => join(resolveDshHome(), 'pg-console.json')
 
-    /** Saved connection (password kept in the document, redacted on the wire) or defaults. */
-    const savedConfig = (): PgConnectionConfig => {
-      const value = settings.get()
-      return {
-        host: String(value.host ?? DEFAULT_CONNECTION.host),
-        port: Number(value.port ?? DEFAULT_CONNECTION.port),
-        user: String(value.user ?? DEFAULT_CONNECTION.user),
-        password: String(value.password ?? ''),
-        database: String(value.database ?? DEFAULT_CONNECTION.database),
-        poolMax: Number(value.poolMax ?? DEFAULT_CONNECTION.poolMax),
-        connectionTimeoutMillis: Number(value.connectionTimeoutMillis ?? DEFAULT_CONNECTION.connectionTimeoutMillis),
+    interface StoreDoc {
+      config?: PgConnectionConfig
+      autoSync?: AutoSyncConfig
+    }
+
+    let store: StoreDoc = {}
+
+    async function loadStore(): Promise<void> {
+      try {
+        const text = await readFile(storePath(), 'utf8')
+        const parsed = JSON.parse(text) as StoreDoc
+        // Take the whole file's shape; password may live in it verbatim.
+        store = typeof parsed === 'object' && parsed !== null ? parsed : {}
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          sctx.logger?.warn?.('[pg-console] store read failed: %s', error instanceof Error ? error.message : String(error))
+        }
+        store = {}
       }
     }
+
+    async function saveStore(): Promise<void> {
+      const file = storePath()
+      await mkdir(dirname(file), { recursive: true })
+      await writeFile(file, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 })
+    }
+
+    /** Saved connection (password kept in the file, redacted on the wire) or defaults. */
+    const savedConfig = (): PgConnectionConfig => ({
+      host: String(store.config?.host ?? DEFAULT_CONNECTION.host),
+      port: Number(store.config?.port ?? DEFAULT_CONNECTION.port),
+      user: String(store.config?.user ?? DEFAULT_CONNECTION.user),
+      password: String(store.config?.password ?? ''),
+      database: String(store.config?.database ?? DEFAULT_CONNECTION.database),
+      poolMax: Number(store.config?.poolMax ?? DEFAULT_CONNECTION.poolMax),
+      connectionTimeoutMillis: Number(store.config?.connectionTimeoutMillis ?? DEFAULT_CONNECTION.connectionTimeoutMillis),
+    })
+
+    /** Saved auto-sync config (always materialized, defaults when unset). */
+    const savedAutoSync = (): AutoSyncConfig => ({
+      enabled: Boolean(store.autoSync?.enabled ?? DEFAULT_AUTO_SYNC.enabled),
+      intervalMinutes: Number(store.autoSync?.intervalMinutes ?? DEFAULT_AUTO_SYNC.intervalMinutes),
+    })
+
+    /** Transient auto-sync state (memory-only; lost on restart, that's fine). */
+    const autoSync: AutoSyncStatus = {
+      armed: false,
+      intervalMinutes: DEFAULT_AUTO_SYNC.intervalMinutes,
+    }
+    let autoSyncInFlight = false
+    let autoSyncTimer: ReturnType<typeof setInterval> | undefined
+
+    /** One JSONL → PG incremental run, guarded against overlap. */
+    const runAutoSync = async (): Promise<AutoSyncStatus> => {
+      if (autoSyncInFlight) {
+        autoSync.skippedOverlap = true
+        return autoSync
+      }
+      autoSyncInFlight = true
+      autoSync.lastRunAt = Date.now()
+      try {
+        const config = savedConfig()
+        if (config.host === '' || config.user === '') {
+          autoSync.lastError = 'connection config is incomplete; auto sync disabled until saved'
+          return autoSync
+        }
+        autoSync.lastError = undefined
+        autoSync.lastResult = await migrate(sctx, 'jsonl-to-pg', config, false, 'skip')
+      } catch (error) {
+        autoSync.lastError = error instanceof Error ? error.message : String(error)
+        autoSync.lastResult = undefined
+      } finally {
+        autoSync.lastFinishedAt = Date.now()
+        autoSyncInFlight = false
+      }
+      return autoSync
+    }
+
+    /** (Re)arm or disarm the interval based on the current saved config. */
+    const armAutoSync = (): void => {
+      const cfg = savedAutoSync()
+      autoSync.intervalMinutes = cfg.intervalMinutes
+      autoSync.armed = cfg.enabled && cfg.intervalMinutes >= 1
+      if (autoSyncTimer !== undefined) {
+        clearInterval(autoSyncTimer)
+        autoSyncTimer = undefined
+      }
+      if (autoSync.armed) {
+        const ms = Math.max(60_000, cfg.intervalMinutes * 60_000)
+        // Kick one run shortly after (re)arming so the copy converges soon;
+        // the interval then keeps it fresh. Re-arms (after settings save)
+        // also kick, so an enable + save converges immediately.
+        const first = setTimeout(() => { void runAutoSync() }, 3000)
+        first.unref?.()
+        autoSyncTimer = setInterval(() => { void runAutoSync() }, ms)
+      }
+    }
+
+    await loadStore()
+    armAutoSync()
+
+    // Clear the interval when this plugin's scope is torn down.
+    ;(sctx as { effect?: <T>(cb: () => T | (() => void), name?: string) => void }).effect?.(() => () => {
+      if (autoSyncTimer !== undefined) {
+        clearInterval(autoSyncTimer)
+        autoSyncTimer = undefined
+      }
+    }, 'dsh-postgres-backends: auto-sync timer')
 
     const api: ConsoleApi = {
       'connection.test': async req => testConnection(sctx, req.config),
@@ -369,7 +473,9 @@ export function apply(ctx: Context): void {
         return { config: { ...rest, password: '' } }
       },
       'connection.save': async req => {
-        await settings.update(req.config)
+        store = { ...store, config: req.config }
+        await saveStore()
+        armAutoSync() // connection may have been blank this whole time
         return { saved: true }
       },
       'migrate.start': async req => {
@@ -379,6 +485,15 @@ export function apply(ctx: Context): void {
         }
         return migrate(sctx, req.direction, config, req.dryRun, req.onConflict ?? 'skip')
       },
+      'autosync.set': async req => {
+        const cfg = req.config
+        store = { ...store, autoSync: { enabled: cfg.enabled, intervalMinutes: Math.max(1, Math.round(cfg.intervalMinutes)) } }
+        await saveStore()
+        armAutoSync()
+        return { saved: true }
+      },
+      'autosync.get': async () => ({ config: savedAutoSync() }),
+      'autosync.status': async () => ({ ...autoSync }),
     }
 
     sctx.inject(['webServer', 'webRuntime'], (wctx) => {

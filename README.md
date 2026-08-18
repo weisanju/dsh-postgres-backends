@@ -62,6 +62,14 @@ cd <deepseek-harness-checkout> && dsh web --patch local-overlay.yml
 
 client 界面通过包的 `dsh.client` 声明自动挂载（设置页出现 "PostgreSQL Backends" section），API 走 `/pg-console/api/*`（受信 loopback 校验）。
 
+> **配置存储**：连接配置与自动同步开关存放在独立的 `~/.dsh/pg-console.json`（0600 权限），**不写入 settings.yaml**。原因：settings.yaml 顶层会被合并进每个 cordis 插件的 config，一个 `pg-backends` namespace 块会污染同名插件（哪怕只有 auto-sync 字段、缺 password）导致主 PG 后端 `client password must be a string` 崩溃。独立文件彻底规避。
+
+**自动增量同步**（设置页开关，或 API）：
+- 开启后 console host 每隔 N 分钟自动跑一次 JSONL → PostgreSQL 增量同步（源只读、目标 append-only，与运行中的实例安全共存）
+- 启动/开启后先立即跑一次收敛，之后按间隔追平生产侧新增
+- 防重入：上一轮未跑完则跳过本轮（`skippedOverlap`）；每轮结果（时间、增量事件数、失败明细）通过 `autosync.status` 查询
+- 关闭则完全不再调度；配置存 JSON 文件，重启保留
+
 HTTP API（与 UI 等价，可脚本化）：
 
 ```bash
@@ -87,7 +95,7 @@ curl -X POST http://127.0.0.1:3081/pg-console/api/migrate.start \
 > - `overwrite`：目标已有且与源不齐 → **整会话重建**（先删目标行再用源全量重建，目标变成源的精确副本）。**仅 PG 为目标时支持**；反向（pg→jsonl）会拒绝，保护生产 JSONL 侧不被删除
 > - `clone`：目标 id 已存在 → 以 `原id-clone` 的新身份完整导入（seq 0..N 连续），目标原有副本保持不动
 
-> **同步方向补课**：迁移是**单向复制**，不是双向合并。JSONL 与 PG 是同一会话的两个事实源候选，但 DSH 的 append-only + 全局唯一 seq 模型不允许两侧同时各写各的（seq 冲突）。**同一时刻只有一个后端在写**：默认用法是"JSONL 权威、PG 定期增量同步副本"；切到 PG 后反过来跑 pg→jsonl 做备份/回滚，而不是双写。
+> **同步方向补课**：迁移是**单向复制**，不是双向合并。JSONL 与 PG 是同一会话的两个事实源候选，但 DSH 的 append-only + 全局唯一 seq 模型不允许两侧同时各写各的（seq 冲突）。**同一时刻只有一个后端在写**：默认用法是"JSONL 权威、PG 定期增量同步副本"——打开自动同步后由 console host 周期自动追平，无需手动；切到 PG 后反过来跑 pg→jsonl 做备份/回滚，而不是双写。
 
 ## 配置项
 

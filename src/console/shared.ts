@@ -35,6 +35,45 @@ export const SETTINGS_NAMESPACE = 'pg-backends'
 /** HTTP API root the host plugin serves (mirrors better-sidebar's /sidebar/api pattern). */
 export const API_ROOT = '/pg-console/api'
 
+/**
+ * Automatic incremental sync (JSONL → PostgreSQL) configuration. When
+ * enabled, the console host re-runs the incremental migration on an
+ * interval, so the PG copy stays near the live JSONL source without manual
+ * runs. The source is read-only and the target write is a contiguous
+ * append, so this is safe alongside a running instance; a run that is
+ * still in flight when the next tick fires is skipped (no overlap).
+ */
+export interface AutoSyncConfig {
+  /** Master switch. */
+  enabled: boolean
+  /** Interval between sync runs, in minutes (>= 1). */
+  intervalMinutes: number
+}
+
+/** The autoSync settings values as stored (with defaults applied). */
+export const DEFAULT_AUTO_SYNC: AutoSyncConfig = {
+  enabled: false,
+  intervalMinutes: 5,
+}
+
+/** Latest automatic-sync outcome, surfaced by autosync.status. */
+export interface AutoSyncStatus {
+  /** Whether auto sync is armed (enabled + interval > 0). */
+  armed: boolean
+  /** Interval in minutes. */
+  intervalMinutes: number
+  /** When the last run started, as epoch ms; absent = never ran. */
+  lastRunAt?: number
+  /** When the last run finished, as epoch ms. */
+  lastFinishedAt?: number
+  /** True when a run was skipped because the previous one was still going. */
+  skippedOverlap?: boolean
+  /** Result of the last run (reports are transient, memory-only). */
+  lastResult?: MigrationStartResult
+  /** Free-form failure from the last attempt. */
+  lastError?: string
+}
+
 /** One test-connection request body. */
 export interface ConnectionTestRequest {
   config: PgConnectionConfig
@@ -124,4 +163,7 @@ export interface ConsoleApi {
   'connection.save': (req: { config: PgConnectionConfig }) => Promise<ConnectionSavedResult>
   'connection.get': () => Promise<{ config: PgConnectionConfig }>
   'migrate.start': (req: MigrationStartRequest) => Promise<MigrationStartResult>
+  'autosync.set': (req: { config: AutoSyncConfig }) => Promise<{ saved: boolean }>
+  'autosync.get': () => Promise<{ config: AutoSyncConfig }>
+  'autosync.status': () => Promise<AutoSyncStatus>
 }

@@ -43,15 +43,52 @@ function jsonlRoot(): string {
   return join(resolveDshHome(), 'sessions')
 }
 
+/**
+ * Wrap the sessions service so a coordinator built below `child` sees NO
+ * live sessions. The coordinator's `installWritePath` iterates
+ * `ctx.sessions.list()` at construction and adopt-checks each live session
+ * against the disk log (`initFor` → `onCreated` → `adoptLivePrefix`). A
+ * live session that was opened after its data was copied into the target
+ * backend (e.g. JSONL → PG migration wrote it, then the user resumed it)
+ * fails that check — "already has a persisted log on disk that does not
+ * match this live session (id collision)" — and the whole migrate run
+ * aborts. The migration engine only needs detached create/append/read, so
+ * hiding live sessions from the isolated backends is exactly right; every
+ * other method (`prepare`, `get`, …) delegates to the real store.
+ */
+function detachLiveSessions(child: Context): void {
+  const parentSessions = child.sessions
+  // Shadow the `sessions` property on the child so the coordinator's
+  // installWritePath sees `list()` → [] (no live sessions to adopt-check).
+  // Every other method (get, prepare, …) still delegates to the parent
+  // store through the Proxy. We cannot use `child.provide('sessions', …)`
+  // because cordis forbids re-registering a name that is already provided
+  // on the parent scope.
+  Object.defineProperty(child, 'sessions', {
+    value: new Proxy(parentSessions, {
+      get(target, prop) {
+        if (prop === 'list') return () => []
+        const value = Reflect.get(target, prop)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    }),
+    configurable: true,
+    enumerable: true,
+    writable: false,
+  })
+}
+
 /** Build an isolated JSONL backend (never registered on the parent scope). */
 function isolatedJsonlBackend(ctx: Context): JsonlSessionPersistence {
   const child = ctx.isolate('sessionPersistence')
+  detachLiveSessions(child)
   return new JsonlSessionPersistence(child, { root: jsonlRoot() })
 }
 
 /** Build an isolated PG backend from a connection config. */
 function isolatedPgBackend(ctx: Context, config: PgConnectionConfig): PostgresSessionPersistence {
   const child = ctx.isolate('sessionPersistence')
+  detachLiveSessions(child)
   return new PostgresSessionPersistence(child, {
     host: config.host,
     port: config.port,

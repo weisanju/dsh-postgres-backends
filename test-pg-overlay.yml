@@ -20,3 +20,8 @@
         user: postgres
         password: postgres
         database: postgres
+
+    # Console host half: connection config + migration API (settings UI
+    # section is served through the dsh.client declaration automatically).
+    - id: pg-console
+      name: 'dsh-postgres-backends/console'

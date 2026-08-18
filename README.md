@@ -45,6 +45,40 @@ dsh plugin --profile web add dsh-postgres-backends
 cd <deepseek-harness-checkout> && dsh web --patch local-overlay.yml
 ```
 
+## PG Console（设置页 UI）
+
+包内附带一个可选的 **Settings 控制台**（默认不启用），在设置页提供：
+
+- **连接配置**：host / port / user / password / database / poolMax 表单 + 测试连接 + 保存（存入 `settings.yaml` 的 `pg-backends` 命名空间，密码不回传浏览器）
+- **会话迁移**：JSONL ⇄ PostgreSQL 双向迁移，支持预览（dry-run）与真实迁移；源只读、目标增量写、幂等可重跑
+
+启用方式：在 profile 补丁的 `insert` 里加一行：
+
+```yaml
+- insert:
+    - id: pg-console
+      name: 'dsh-postgres-backends/console'
+```
+
+client 界面通过包的 `dsh.client` 声明自动挂载（设置页出现 "PostgreSQL Backends" section），API 走 `/pg-console/api/*`（受信 loopback 校验）。
+
+HTTP API（与 UI 等价，可脚本化）：
+
+```bash
+# 测试连接
+curl -X POST http://127.0.0.1:3081/pg-console/api/connection.test \
+  -H 'content-type: application/json' \
+  -d '{"config":{"host":"localhost","port":5432,"user":"postgres","password":"postgres","database":"postgres"}}'
+# → {"ok":true,"value":{"ok":true,"latencyMs":6}}
+
+# JSONL → PG 真实迁移（dryRun:true 仅预览）
+curl -X POST http://127.0.0.1:3081/pg-console/api/migrate.start \
+  -H 'content-type: application/json' \
+  -d '{"direction":"jsonl-to-pg","config":{"host":"localhost","port":5432,"user":"postgres","password":"postgres","database":"postgres"},"dryRun":false}'
+```
+
+> 迁移只**复制**不删除：源保持原样，目标已存在的会话自动跳过（幂等）。迁移期间 PG 后端会分块插入（单事务内 4000 事件/批，规避 PostgreSQL 单条 INSERT 的 65535 绑定参数上限）。
+
 ## 配置项
 
 | 键 | 必填 | 默认 | 说明 |

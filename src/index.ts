@@ -272,24 +272,32 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
       await client.query('BEGIN')
       if (!isMaterialized) await this.writeRow(client, meta)
       if (events.length > 0) {
-        // One multi-row INSERT for the whole batch (8 bindings per event).
-        const rows = events.map((_, i) => {
-          const base = i * 8
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb, $${base + 8})`
-        }).join(', ')
-        const values: unknown[] = []
-        for (const event of events) {
-          const [surfaceSeqs, surfaceOp, ignorable] = envelopeBindings(event)
-          values.push(
-            meta.id, event.seq, event.type, event.time,
-            JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp, ignorable,
+        // Multi-row INSERT with 8 bindings per event; the PostgreSQL wire
+        // protocol caps a bind message at 65535 parameters, so a batch with
+        // more than ~8000 events (64k bindings) must be chunked. Chunks stay
+        // inside one transaction: a mid-way failure rolls the whole batch
+        // back, preserving the append-only / contiguous-seq contract.
+        const BINDING_CHUNK = 4000
+        for (let offset = 0; offset < events.length; offset += BINDING_CHUNK) {
+          const chunk = events.slice(offset, offset + BINDING_CHUNK)
+          const rows = chunk.map((_, i) => {
+            const base = i * 8
+            return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb, $${base + 8})`
+          }).join(', ')
+          const values: unknown[] = []
+          for (const event of chunk) {
+            const [surfaceSeqs, surfaceOp, ignorable] = envelopeBindings(event)
+            values.push(
+              meta.id, event.seq, event.type, event.time,
+              JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp, ignorable,
+            )
+          }
+          await client.query(
+            `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
+             VALUES ${rows}`,
+            values,
           )
         }
-        await client.query(
-          `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op, ignorable)
-           VALUES ${rows}`,
-          values,
-        )
       }
       await client.query('UPDATE sessions SET revision = revision + 1 WHERE id = $1', [meta.id])
       await client.query('COMMIT')

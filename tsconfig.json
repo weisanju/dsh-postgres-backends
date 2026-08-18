@@ -21,5 +21,5 @@
     "types": ["node"]
   },
   "include": ["src"],
-  "exclude": ["lib", "node_modules", "tests"]
+  "exclude": ["lib", "node_modules", "tests", "src/console/client"]
 }

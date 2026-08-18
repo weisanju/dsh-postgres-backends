@@ -18,6 +18,7 @@ import {
   API_ROOT,
   DEFAULT_CONNECTION,
   type ConnectionTestResult,
+  type MigrationConflictPolicy,
   type MigrationDirection,
   type MigrationSessionResult,
   type MigrationStartResult,
@@ -113,6 +114,7 @@ export function PgConsoleSection(): ReactNode {
   const [migrating, setMigrating] = useState<MigrationDirection | undefined>()
   const [report, setReport] = useState<MigrationStartResult | undefined>()
   const [migrateError, setMigrateError] = useState<string | undefined>()
+  const [onConflict, setOnConflict] = useState<MigrationConflictPolicy>('skip')
   const mounted = useRef(true)
 
   useEffect(() => {
@@ -171,7 +173,7 @@ export function PgConsoleSection(): ReactNode {
     setMigrateError(undefined)
     setReport(undefined)
     try {
-      const result = await call<MigrationStartResult>('migrate.start', { direction, dryRun })
+      const result = await call<MigrationStartResult>('migrate.start', { direction, dryRun, onConflict })
       if (mounted.current) setReport(result)
     } catch (error) {
       if (mounted.current) setMigrateError(error instanceof Error ? error.message : String(error))
@@ -179,6 +181,13 @@ export function PgConsoleSection(): ReactNode {
       if (mounted.current) setMigrating(undefined)
     }
   }
+
+  /** Human-readable conflict policy options. */
+  const conflictOptions: { value: MigrationConflictPolicy; label: string; hint: string }[] = [
+    { value: 'skip', label: '跳过 (skip)', hint: '目标已有 → 不写；目标更多 → 报告差异' },
+    { value: 'overwrite', label: '覆盖 (overwrite)', hint: '删除目标整会话，用源重建（仅 PG 为目标时）' },
+    { value: 'clone', label: '新建副本 (clone)', hint: '目标 id 冲突时换新 id 导入，保留目标' },
+  ]
 
   const directionLabel: Record<MigrationDirection, string> = {
     'jsonl-to-pg': 'JSONL → PostgreSQL',
@@ -288,6 +297,31 @@ export function PgConsoleSection(): ReactNode {
           会话迁移
           <span className={styles.count}>JSONL ⇄ PostgreSQL（源只读，增量写目标）</span>
         </div>
+        <div className={styles.row}>
+          <div className={styles.rowText}>
+            <span className={styles.title}>冲突处理</span>
+            <span className={styles.desc}>
+              目标已存在同一会话时的行为。默认 skip 最安全；overwrite 重建目标；clone 换新 id 导入。
+            </span>
+          </div>
+          <div className={styles.rowActions}>
+            <label className={styles.selectWrap}>
+              <select
+                className={styles.select}
+                value={onConflict}
+                disabled={migrating !== undefined}
+                onChange={(e) => setOnConflict(e.target.value as MigrationConflictPolicy)}
+              >
+                {conflictOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </div>
+        <p className={`${styles.status}`}>
+          {conflictOptions.find((opt) => opt.value === onConflict)?.hint}
+        </p>
         {(Object.keys(directionLabel) as MigrationDirection[]).map((direction) => (
           <div key={direction} className={styles.row}>
             <div className={styles.rowText}>
@@ -370,8 +404,17 @@ function MigrationReport({
           ))}
           {skipped.map((s) => (
             <li key={s.sessionId} className={styles.failItem}>
-              <code className={styles.code}>{shortId(s.sessionId)}</code>
+              <code className={styles.code}>
+                {shortId(s.sessionId)}
+                {s.clonedTo !== undefined ? ` → ${shortId(s.clonedTo)}` : ''}
+              </code>
               <span className={styles.dim}>{s.skipped}</span>
+              {s.targetAhead !== undefined && s.targetAhead > 0 && (
+                <span className={styles.warn}> · 目标多 {fmtCount(s.targetAhead)} 条</span>
+              )}
+              {s.overwritten === true && (
+                <span className={styles.warn}> · 已整会话重建</span>
+              )}
             </li>
           ))}
         </ul>

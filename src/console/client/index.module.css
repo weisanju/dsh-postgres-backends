@@ -242,3 +242,29 @@
     transition: none;
   }
 }
+.selectWrap {
+  display: inline-flex;
+}
+
+.select {
+  box-sizing: border-box;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  border-radius: 8px;
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.select:focus {
+  outline: 2px solid var(--dsw-alias-border-l4);
+  outline-offset: 1px;
+  border-color: var(--dsw-alias-button-primary-fill);
+}
+
+.warn {
+  color: var(--dsw-alias-warning-strong, #b45309);
+}

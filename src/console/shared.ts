@@ -58,6 +58,20 @@ export interface ConnectionSavedResult {
 
 export type MigrationDirection = 'jsonl-to-pg' | 'pg-to-jsonl'
 
+/**
+ * Conflict policy for a session whose target already holds events:
+ * - `skip` (default): target already synced → report up-to-date, no writes;
+ *   target has MORE than source → report the ahead-delta as a hint, no writes.
+ * - `overwrite`: rebuild the target session wholesale from the source
+ *   (delete the target's rows, then append the full source log). Only
+ *   supported when PostgreSQL is the TARGET (jsonl→pg); the reverse
+ *   direction never deletes the JSONL side.
+ * - `clone`: if inserting under the source id would collide with existing
+ *   target content, import under a fresh id (source content preserved,
+ *   identity changed) instead of failing.
+ */
+export type MigrationConflictPolicy = 'skip' | 'overwrite' | 'clone'
+
 /** One migration run request. */
 export interface MigrationStartRequest {
   direction: MigrationDirection
@@ -65,6 +79,8 @@ export interface MigrationStartRequest {
   config?: PgConnectionConfig
   /** When true, scan and report without writing anything. */
   dryRun: boolean
+  /** Conflict handling when the target already holds this session. Default: 'skip'. */
+  onConflict?: MigrationConflictPolicy
 }
 
 /** Per-session migration outcome. */
@@ -77,6 +93,12 @@ export interface MigrationSessionResult {
   skipped?: string
   /** Failure message; absent = success. */
   error?: string
+  /** When the target held more events than the source (direction hint). */
+  targetAhead?: number
+  /** The id actually written when a conflict was cloned under a fresh id. */
+  clonedTo?: string
+  /** Whether the target was rebuilt wholesale (overwrite policy). */
+  overwritten?: boolean
 }
 
 /** One migration run report. */
@@ -84,6 +106,8 @@ export interface MigrationStartResult {
   ok: boolean
   direction: MigrationDirection
   dryRun: boolean
+  /** Conflict policy applied. */
+  onConflict: MigrationConflictPolicy
   /** Sessions that migrated (or would migrate). */
   sessions: MigrationSessionResult[]
   /** Sum of events across successful sessions. */

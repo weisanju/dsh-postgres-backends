@@ -379,6 +379,18 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
     await this.pool.end()
   }
 
+  /**
+   * Wholesale-delete one session (sessions row + CASCADE events) — the
+   * overwrite building block for the console migration engine. Intended for
+   * an ISOLATED backend instance owned by the migrator, never for the
+   * mounted runtime backend: deleting rows out from under a live coordinator
+   * would strand its in-memory cursor.
+   */
+  async resetSession(id: SessionId, signal?: AbortSignal): Promise<void> {
+    await this.guard(signal)
+    await this.pool.query('DELETE FROM sessions WHERE id = $1', [id])
+  }
+
   // --- helpers ---
 
   /**

@@ -33,6 +33,7 @@ import {
   SETTINGS_NAMESPACE,
   type ConsoleApi,
   type ConnectionTestResult,
+  type MigrationConflictPolicy,
   type MigrationDirection,
   type MigrationSessionResult,
   type MigrationStartResult,
@@ -87,7 +88,24 @@ interface MigrationEndpoints {
   targetRead: (id: SessionId) => Promise<{ meta: SessionHeader; events: SessionEvent[] }>
   targetCreate: (meta: SessionHeader) => Promise<void>
   targetAppend: (id: SessionId, events: SessionEvent[]) => Promise<void>
+  /**
+   * Delete one target session's rows wholesale (overwrite policy). Only the
+   * PostgreSQL target implements this; the JSONL target refuses (the reverse
+   * direction must never delete the production side, and the official JSONL
+   * backend exposes no delete surface).
+   */
+  targetReset: (id: SessionId) => Promise<void>
   close: () => Promise<void>
+}
+
+/** Whether the overwrite policy can run for this direction (PG must be the target). */
+function overwriteSupported(direction: MigrationDirection): boolean {
+  return direction === 'jsonl-to-pg'
+}
+
+/** The id used when cloning a colliding session under a fresh identity. */
+function cloneId(id: string): string {
+  return `${id}-clone`
 }
 
 /** Build the two isolated backend endpoints for one migration direction. */
@@ -108,6 +126,7 @@ async function endpointsFor(
       targetRead: async (id: SessionId) => pg.readFrom(id, 0),
       targetCreate: meta => pg.create(meta),
       targetAppend: (id, events) => pg.append(id, events),
+      targetReset: async (id) => { await pg.resetSession(id) },
       close: async () => { await pg.close() },
     }
   }
@@ -120,6 +139,9 @@ async function endpointsFor(
     targetRead: async (id: SessionId) => json.readFrom(id, 0),
     targetCreate: meta => json.create(meta),
     targetAppend: (id, events) => json.append(id, events),
+    targetReset: async () => {
+      throw new Error('overwrite is only supported when PostgreSQL is the migration target')
+    },
     close: async () => { await pg.close() },
   }
 }
@@ -130,12 +152,14 @@ async function migrate(
   direction: MigrationDirection,
   config: PgConnectionConfig,
   dryRun: boolean,
+  onConflict: MigrationConflictPolicy = 'skip',
 ): Promise<MigrationStartResult> {
   const endpoints = await endpointsFor(ctx, direction, config)
   const result: MigrationStartResult = {
     ok: true,
     direction,
     dryRun,
+    onConflict,
     sessions: [],
     eventsTotal: 0,
     sourceTotal: 0,
@@ -145,46 +169,94 @@ async function migrate(
     result.sourceTotal = headers.length
     for (const header of headers) {
       const session: MigrationSessionResult = { sessionId: header.id, events: 0 }
+      let meta!: SessionHeader
+      let events!: SessionEvent[]
       try {
-        const { meta, events } = await endpoints.sourceRead(header.id)
+        const read = await endpoints.sourceRead(header.id)
+        meta = read.meta
+        events = read.events
         session.events = events.length
         if (!dryRun) {
-          // Event-level incremental migration: never re-create a target that
-          // already holds part of this session. Read the target's committed
-          // length for this id and append only the source suffix past it —
-          // append's contiguity check (seq === cursor) makes the delta safe.
-          // An absent target takes the full log.
+          // Read the target's committed length for this id. Absent target:
+          // full migration. Present target: apply the conflict policy.
           let targetLen = 0
+          let targetAhead = 0
+          let targetExists = true
           try {
             const targetLog = await endpoints.targetRead(header.id)
             targetLen = targetLog.events.length
           } catch (error) {
             if (!/not found/.test(error instanceof Error ? error.message : String(error))) throw error
-            // Absent target: full migration below.
+            targetExists = false
           }
-          const delta = events.slice(targetLen)
-          if (delta.length > 0) {
-            if (targetLen === 0) await endpoints.targetCreate(meta)
+
+          if (!targetExists) {
+            // Full migration: create the target lazily, append the whole log.
+            await endpoints.targetCreate(meta)
+            await endpoints.targetAppend(meta.id, events)
+            result.eventsTotal += events.length
+          } else if (onConflict === 'clone') {
+            // Clone policy: the target already holds this id, so import the
+            // source content under a fresh identity and leave the target's
+            // copy untouched. seq stays 0..N-1 in the new session, so the
+            // fresh id accepts the full log directly.
+            const cloned = cloneId(header.id)
+            const cloneMeta: SessionHeader = { ...meta, id: cloned as SessionId }
+            await endpoints.targetCreate(cloneMeta)
+            await endpoints.targetAppend(cloned as SessionId, events)
+            session.clonedTo = cloned
+            session.skipped = `target id existed; imported under ${cloned}`
+            result.eventsTotal += events.length
+          } else if (targetLen > events.length) {
+            // Direction hint: the target holds MORE than the source. The
+            // default policy never deletes, so report the gap honestly.
+            session.targetAhead = targetLen - events.length
+            if (onConflict === 'overwrite') {
+              if (!overwriteSupported(direction)) {
+                throw new Error('overwrite is only supported when PostgreSQL is the migration target')
+              }
+              // Rebuild the target wholesale: delete the row (CASCADE events),
+              // then recreate from the source so the target is an exact copy.
+              await endpoints.targetReset(meta.id)
+              await endpoints.targetCreate(meta)
+              await endpoints.targetAppend(meta.id, events)
+              session.overwritten = true
+              session.skipped = 'target rebuilt from source (overwrite)'
+              result.eventsTotal += events.length
+            } else {
+              session.skipped = `target is ahead by ${session.targetAhead} events (not deleted by default)`
+            }
+          } else if (targetLen < events.length) {
+            // Incremental tail-sync: append only the source suffix past the
+            // target's committed length.
+            const delta = events.slice(targetLen)
             await endpoints.targetAppend(meta.id, delta)
+            result.eventsTotal += delta.length
           } else {
             session.skipped = 'target is up to date'
           }
-          result.eventsTotal += delta.length
         } else {
           result.eventsTotal += events.length
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        // A target that already holds this session is an idempotent skip
-        // (the coordinator refuses duplicate ids), not a failure — re-running
-        // a migration after a partial success must not count as an error.
+        // mask single-session conflicts from the aggregate failure flag
         if (/already has a persisted log on disk/.test(message) || /already exists in this backend/.test(message)) {
+          if (onConflict === 'clone') {
+            // Colliding identity: import the session under a fresh id so the
+            // source content is preserved without touching the target's copy.
+            const cloned = cloneId(header.id)
+            const cloneMeta: SessionHeader = { ...meta, id: cloned as SessionId }
+            await endpoints.targetCreate(cloneMeta)
+            await endpoints.targetAppend(cloned as SessionId, events)
+            session.clonedTo = cloned
+            session.skipped = `target id existed; imported under ${cloned}`
+            result.eventsTotal += events.length
+            result.sessions.push(session)
+            continue
+          }
           session.skipped = 'target already has this session'
         } else if (/append seq mismatch/.test(message)) {
-          // The source grew between this session's target-length read and its
-          // append (a live source backend keeps appending). The run is still
-          // authoritative: nothing was written for this session, and a later
-          // run re-reads the longer source and picks up the remainder.
           session.skipped = 'source changed mid-run; re-run to pick up the tail'
         } else {
           session.error = message
@@ -303,9 +375,9 @@ export function apply(ctx: Context): void {
       'migrate.start': async req => {
         const config = req.config ?? savedConfig()
         if (config.host === '' || config.user === '') {
-          return { ok: false, direction: req.direction, dryRun: req.dryRun, sessions: [], eventsTotal: 0, sourceTotal: 0, error: 'connection config is incomplete' }
+          return { ok: false, direction: req.direction, dryRun: req.dryRun, onConflict: req.onConflict ?? 'skip', sessions: [], eventsTotal: 0, sourceTotal: 0, error: 'connection config is incomplete' }
         }
-        return migrate(sctx, req.direction, config, req.dryRun)
+        return migrate(sctx, req.direction, config, req.dryRun, req.onConflict ?? 'skip')
       },
     }
 

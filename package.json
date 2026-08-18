@@ -1,7 +1,7 @@
 {
   "name": "dsh-postgres-backends",
   "description": "PostgreSQL durable backend family for DeepSeek Harness — session persistence today, more backends (settings, …) to come. Includes a Settings console for connection config and bidirectional session migration (JSONL ⇄ PostgreSQL). Third-party, does not modify the Harness source tree.",
-  "version": "0.1.0-beta.11",
+  "version": "0.1.0-beta.12",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -33,10 +33,14 @@
     "lib/client.js",
     "lib/client.js.map",
     "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-runtime",

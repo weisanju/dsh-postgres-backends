@@ -1,0 +1,29 @@
+# Bundle patch for dsh-postgres-backends.
+# When this package is listed in the profile's `dsh.profile.bundles`,
+# DSH automatically applies this patch to:
+#   1. Disable the default JSONL session persistence
+#   2. Register the PostgreSQL session persistence backend
+#   3. Register the PG console (connection config + migration UI)
+#
+# Connection config is overridable via the console settings UI; the
+# defaults below match the standard local PostgreSQL instance.
+#
+# Usage:
+#   Add to ~/.dsh/profiles/<name>/package.json:
+#     "dsh": { "profile": { "bundles": [..., "dsh-postgres-backends"] } }
+
+- id: session-persistence-jsonl
+  disabled: true
+
+- insert:
+    - id: session-persistence-postgres
+      name: 'dsh-postgres-backends'
+      config:
+        host: localhost
+        port: 5432
+        user: postgres
+        password: postgres
+        database: postgres
+
+    - id: pg-console
+      name: 'dsh-postgres-backends/console'

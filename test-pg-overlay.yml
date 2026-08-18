@@ -1,27 +1,13 @@
-# Test overlay: swap JSONL for PostgreSQL, different port so it doesn't conflict
-# with the running web instance. Usage:
-#   dsh --profile web --patch test-pg-overlay.yml --dump-config   # verify config only
-#   dsh --profile web --patch test-pg-overlay.yml                 # boot test instance
+# Test overlay: override web server port + disable JSONL + enable PG backend.
+# This is a development overlay for running a second instance alongside the
+# production web profile.  The PG backend + console registration is now
+# handled by the bundle's cordis.patch.yml (auto-loaded when the package is
+# listed in dsh.profile.bundles).  This overlay only overrides the port.
+#
+# Usage:
+#   dsh --profile web --patch test-pg-overlay.yml   # boot test instance on 3081
 
 - id: webserver
   config:
     host: 0.0.0.0
     port: 3081
-
-- id: session-persistence-jsonl
-  disabled: true
-
-- insert:
-    - id: session-persistence-postgres
-      name: 'dsh-postgres-backends'
-      config:
-        host: localhost
-        port: 5432
-        user: postgres
-        password: postgres
-        database: postgres
-
-    # Console host half: connection config + migration API (settings UI
-    # section is served through the dsh.client declaration automatically).
-    - id: pg-console
-      name: 'dsh-postgres-backends/console'

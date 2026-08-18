@@ -1,15 +1,16 @@
-# dsh-session-persistence-postgres
+# dsh-postgres-backends
 
-PostgreSQL durable session-persistence backend for DeepSeek Harness — a third-party `SessionPersistence` provider satisfying the same contract as the official JSONL/SQLite backends (append-only, contiguous-seq, lazy materialization, interrupted-turn close on load), expressed over PostgreSQL rows instead of file bytes or `node:sqlite`.
+PostgreSQL durable backend family for DeepSeek Harness. Today: a third-party `SessionPersistence` provider satisfying the same contract as the official JSONL/SQLite backends (append-only, contiguous-seq, lazy materialization, interrupted-turn close on load), expressed over PostgreSQL rows instead of file bytes or `node:sqlite`. More PG backends (settings, …) land here over time.
 
 独立第三方仓库，不改动 DeepSeek Harness 源码。通过 profile 的 `cordis.patch.yml` 替换默认持久化后端为 PostgreSQL。
 
 ## 特性
 
 - **事件溯源不变**：每个 `SessionEvent` 映射一行 `events` 表，`data` 存 JSONB；`sessions` 表存 out-of-log metadata
-- **追加 = 事务**：`BEGIN`/`COMMIT` 包住整批，中批失败整体回滚
+- **追加 = 事务**：`BEGIN`/`COMMIT` 包住整批，中批失败整体回滚；单条 multi-row INSERT 批量写入
 - **惰性物化**：首笔 `append` 才写 `sessions` 行（`list` 只报有行的会话）
 - **崩溃恢复**：`load` 时合成关闭事件（`TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN`）
+- **NUL 安全**：DSH scope key 的 U+0000 经双层转义进出 JSONB（见下文）
 - **异步驱动**：使用 `pg` 连接池，不阻塞事件循环（优于官方 SQLite 的同步 `DatabaseSync`）
 - **跨机共享**：连远程 PostgreSQL 即可多机共享同一会话库
 
@@ -18,8 +19,8 @@ PostgreSQL durable session-persistence backend for DeepSeek Harness — a third-
 ### 1. 将本包加入 web profile
 
 ```bash
-dsh plugin --profile web add <本仓库路径>
-# 例如：dsh plugin --profile web add /home/weisanju/gitrepos/personal-architecture/dsh-session-persistence-postgres
+dsh plugin --profile web add dsh-postgres-backends
+# 本地开发：dsh plugin --profile web add /home/weisanju/gitrepos/dsh-postgres-backends
 ```
 
 ### 2. 在 profile 补丁中替换默认 JSONL 后端
@@ -33,7 +34,7 @@ dsh plugin --profile web add <本仓库路径>
 
 - insert:
     - id: session-persistence-postgres
-      name: 'dsh-session-persistence-postgres'
+      name: 'dsh-postgres-backends'
       config:
         connectionString: 'postgres://postgres:postgres@localhost:5432/postgres'
 ```
@@ -41,7 +42,7 @@ dsh plugin --profile web add <本仓库路径>
 ### 3. 重启
 
 ```bash
-cd <deepseek-harness-checkout> && pnpm dsh web --patch local-overlay.yml
+cd <deepseek-harness-checkout> && dsh web --patch local-overlay.yml
 ```
 
 ## 配置项

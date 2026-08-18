@@ -85,11 +85,24 @@ function isolatedJsonlBackend(ctx: Context): JsonlSessionPersistence {
   return new JsonlSessionPersistence(child, { root: jsonlRoot() })
 }
 
-/** Build an isolated PG backend from a connection config. */
-function isolatedPgBackend(ctx: Context, config: PgConnectionConfig): PostgresSessionPersistence {
+/** Build an isolated PG backend from a connection config.
+ *
+ * Uses `ctx.plugin()` so the `Fiber` constructor creates a child context with
+ * its own fiber (`parent.extend({ fiber: this })`).  The
+ * `PersistenceCoordinator`'s `ctx.effect`/`ctx.on` then register on the new
+ * fiber's `_disposables` rather than the parent fiber.  Call `fiber.dispose()`
+ * (via the returned `dispose` function) to clean up both the pool and the
+ * event listeners — without that, `session/created` events from the parent
+ * SessionStore would fire after the pool is closed and crash with "Cannot use
+ * a pool after calling end on the pool".
+ */
+async function isolatedPgBackend(
+  ctx: Context,
+  config: PgConnectionConfig,
+): Promise<{ pg: PostgresSessionPersistence; dispose: () => Promise<void> }> {
   const child = ctx.isolate('sessionPersistence')
   detachLiveSessions(child)
-  return new PostgresSessionPersistence(child, {
+  const fiber = await child.plugin(PostgresSessionPersistence, {
     host: config.host,
     port: config.port,
     user: config.user,
@@ -101,20 +114,26 @@ function isolatedPgBackend(ctx: Context, config: PgConnectionConfig): PostgresSe
     poolMax: config.poolMax,
     connectionTimeoutMillis: config.connectionTimeoutMillis,
   })
+  const pg = fiber.ctx.sessionPersistence as PostgresSessionPersistence
+  return {
+    pg,
+    dispose: () => (fiber as any).dispose(),
+  }
 }
 
 /** Test one connection: a minimal round-trip read against the sessions table. */
 async function testConnection(ctx: Context, config: PgConnectionConfig): Promise<ConnectionTestResult> {
-  let pg: PostgresSessionPersistence | undefined
+  let dispose: (() => Promise<void>) | undefined
   try {
-    pg = isolatedPgBackend(ctx, { ...config, connectionTimeoutMillis: 3000 })
+    const { pg, dispose: d } = await isolatedPgBackend(ctx, { ...config, connectionTimeoutMillis: 3000 })
+    dispose = d
     const started = performance.now()
     await pg.list()
     return { ok: true, latencyMs: Math.round(performance.now() - started) }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
   } finally {
-    await pg?.close()
+    await dispose?.()
   }
 }
 
@@ -153,7 +172,7 @@ async function endpointsFor(
   config: PgConnectionConfig,
 ): Promise<MigrationEndpoints> {
   const json = isolatedJsonlBackend(ctx)
-  const pg = isolatedPgBackend(ctx, config)
+  const { pg, dispose } = await isolatedPgBackend(ctx, config)
   if (direction === 'jsonl-to-pg') {
     return {
       sourceList: () => json.list(),
@@ -165,7 +184,7 @@ async function endpointsFor(
       targetCreate: meta => pg.create(meta),
       targetAppend: (id, events) => pg.append(id, events),
       targetReset: async (id) => { await pg.resetSession(id) },
-      close: async () => { await pg.close() },
+      close: dispose,
     }
   }
   return {
@@ -180,7 +199,7 @@ async function endpointsFor(
     targetReset: async () => {
       throw new Error('overwrite is only supported when PostgreSQL is the migration target')
     },
-    close: async () => { await pg.close() },
+    close: dispose,
   }
 }
 

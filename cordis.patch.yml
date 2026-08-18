@@ -3,7 +3,9 @@
 # DSH automatically applies this patch to:
 #   1. Disable the default JSONL session persistence
 #   2. Register the PostgreSQL session persistence backend
-#   3. Register the PG console (connection config + migration UI)
+#   3. Register the PostgreSQL KV storage backend (storage.backend.postgres)
+#   4. Route the storage-domain layer onto the postgres KV backend
+#   5. Register the PG console (connection config + migration UI)
 #
 # Connection config is overridable via the console settings UI; the
 # defaults below match the standard local PostgreSQL instance.
@@ -25,5 +27,25 @@
         password: postgres
         database: postgres
 
+    - id: storage-postgres
+      name: 'dsh-postgres-backends/storage'
+      config:
+        host: localhost
+        port: 5432
+        user: postgres
+        password: postgres
+        database: postgres
+
     - id: pg-console
       name: 'dsh-postgres-backends/console'
+
+# Route every storage-domain unit onto the PostgreSQL KV backend instead of
+# the JSON file backend. The web-app bundle's storage-domain row configures
+# `backend: json` by default; a patch replaces the whole config, so restate
+# only `backend` (and an empty `routes`, kept explicit for clarity). Migrating
+# existing ~/.dsh/storages/*.json into PostgreSQL is a manual one-time step
+# surfaced by the PG console's Storage section.
+- id: storage-domain
+  config:
+    backend: postgres
+    routes: {}

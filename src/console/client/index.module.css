@@ -269,3 +269,29 @@
   color: var(--dsw-alias-warning-strong, #b45309);
 }
 
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.th {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  color: var(--dsh-alias-label-secondary, var(--dsw-alias-label-secondary));
+  font-weight: 600;
+}
+
+.td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  vertical-align: top;
+  word-break: break-word;
+}
+
+.tr:last-child .td {
+  border-bottom: none;
+}
+

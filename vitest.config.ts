@@ -7,5 +7,11 @@ export default defineConfig({
     globals: true,
     testTimeout: 30000,
     hookTimeout: 30000,
+    // Specs share one isolated test database (`dsh_test`, or the connection
+    // string in DSH_PG_TEST_CONN — see tests/helpers/db.ts); parallel files
+    // would drop each other's tables mid-test. Run files serially — within a
+    // file, beforeEach still isolates each test. The production database is
+    // never touched.
+    fileParallelism: false,
   },
 })

@@ -1,20 +1,20 @@
 /**
  * Basic contract tests for the PostgreSQL session-persistence backend.
- * Requires a local PostgreSQL instance at the default connection string.
+ * Targets an isolated `dsh_test` database (see helpers/db.ts), never the
+ * production database.
  */
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SessionStore from '@deepseek-ai/dsh-session'
 import { PostgresSessionPersistence, type Config } from '../src/index.ts'
 import { escapeNulText, unescapeNulText } from '../src/schema.ts'
 import { randomUUID } from 'node:crypto'
-
-const CONNECTION_STRING = 'postgres://postgres:postgres@localhost:5432/postgres'
+import { ensureTestDatabase, TEST_CONNECTION_STRING } from './helpers/db.ts'
 
 /** Rebuild the test schema before each test so state is isolated. */
 async function resetSchema(): Promise<void> {
   const { Pool } = await import('pg')
-  const pool = new Pool({ connectionString: CONNECTION_STRING })
+  const pool = new Pool({ connectionString: TEST_CONNECTION_STRING })
   await pool.query('DROP TABLE IF EXISTS events CASCADE')
   await pool.query('DROP TABLE IF EXISTS sessions CASCADE')
   await pool.query('DROP TABLE IF EXISTS persistence_state CASCADE')
@@ -30,7 +30,7 @@ async function createBackend(config: Partial<Config> = {}): Promise<{
   const ctx = new Context()
   await ctx.plugin(SessionStore)
   const fiber = await ctx.plugin(PostgresSessionPersistence, {
-    connectionString: CONNECTION_STRING,
+    connectionString: TEST_CONNECTION_STRING,
     preparedSessionCacheSize: 2,
     writeBatchMaxDelayMs: 100,
     ...config,
@@ -43,6 +43,7 @@ async function createBackend(config: Partial<Config> = {}): Promise<{
 }
 
 describe('PostgresSessionPersistence', () => {
+  beforeAll(ensureTestDatabase)
   beforeEach(resetSchema)
 
   it('registers as ctx.sessionPersistence', async () => {
@@ -226,6 +227,7 @@ describe('escapeNulText / unescapeNulText', () => {
 })
 
 describe('PostgresSessionPersistence robustness', () => {
+  beforeAll(ensureTestDatabase)
   beforeEach(resetSchema)
 
   it('surfaces a foreign-key violation when the sessions row was deleted out of band (no silent heal)', async () => {
@@ -242,7 +244,7 @@ describe('PostgresSessionPersistence robustness', () => {
 
     // Simulate an out-of-band deletion of the sessions row (CASCADE empties events too).
     const { Pool } = await import('pg')
-    const pool = new Pool({ connectionString: CONNECTION_STRING })
+    const pool = new Pool({ connectionString: TEST_CONNECTION_STRING })
     await pool.query('DELETE FROM sessions WHERE id = $1', [id])
     await pool.end()
 

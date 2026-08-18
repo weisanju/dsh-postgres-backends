@@ -42,7 +42,12 @@ import {
   type MigrationSessionResult,
   type MigrationStartResult,
   type PgConnectionConfig,
+  type StorageListRequest,
+  type StorageListResult,
+  type StorageMigrateRequest,
+  type StorageMigrateResult,
 } from './shared.ts'
+import { listStorage, migrateStorage } from './storage-migrate.ts'
 
 /**
  * Minimal shape of the object returned by `ctx.plugin()` — a cordis `Fiber`
@@ -490,6 +495,30 @@ export function apply(ctx: Context): void {
           return { ok: false, direction: req.direction, dryRun: req.dryRun, onConflict: req.onConflict ?? 'skip', sessions: [], eventsTotal: 0, sourceTotal: 0, error: 'connection config is incomplete' }
         }
         return migrate(sctx, req.direction, config, req.dryRun, req.onConflict ?? 'skip')
+      },
+      'storage.list': async (req: StorageListRequest) => listStorage(req.config ?? savedConfig()),
+      'storage.migrate': async (req: StorageMigrateRequest) => {
+        const config = req.config ?? savedConfig()
+        if (config.host === '' || config.user === '') {
+          return {
+            ok: false,
+            direction: req.direction,
+            dryRun: req.dryRun,
+            onConflict: req.onConflict ?? 'skip',
+            rebootstrap: req.rebootstrap ?? false,
+            units: [],
+            recordsTotal: 0,
+            sourceTotal: 0,
+            error: 'connection config is incomplete',
+          }
+        }
+        return migrateStorage(
+          config,
+          req.direction,
+          req.dryRun,
+          req.onConflict ?? 'skip',
+          req.rebootstrap ?? false,
+        )
       },
     }
 

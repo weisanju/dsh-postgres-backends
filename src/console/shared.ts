@@ -124,4 +124,110 @@ export interface ConsoleApi {
   'connection.save': (req: { config: PgConnectionConfig }) => Promise<ConnectionSavedResult>
   'connection.get': () => Promise<{ config: PgConnectionConfig }>
   'migrate.start': (req: MigrationStartRequest) => Promise<MigrationStartResult>
+  'storage.list': (req: StorageListRequest) => Promise<StorageListResult>
+  'storage.migrate': (req: StorageMigrateRequest) => Promise<StorageMigrateResult>
+}
+
+// ── Storage-domain migration (JSON ⇄ PostgreSQL KV backend) ─────────────────
+
+/**
+ * One side's view of a unit, for the side-by-side comparison the console
+ * renders before a migration. `present` is false when this side holds no
+ * trace of the unit (e.g. PG has no row in `kv_units` for it).
+ */
+export interface StorageUnitSide {
+  present: boolean
+  version?: number
+  recordCount?: number
+  /** Whether the unit carries a written global singleton. */
+  hasGlobal?: boolean
+  /** Read failure for this unit on this side (e.g. a corrupt JSON file). */
+  error?: string
+}
+
+/** One unit row in the storage comparison. */
+export interface StorageUnitEntry {
+  name: string
+  json: StorageUnitSide
+  pg: StorageUnitSide
+}
+
+/** `storage.list` request body. */
+export interface StorageListRequest {
+  config?: PgConnectionConfig
+}
+
+/** `storage.list` response: both sides' unit inventories joined by name. */
+export interface StorageListResult {
+  ok: boolean
+  units: StorageUnitEntry[]
+  /** JSON root directory the file side was read from. */
+  jsonRoot: string
+  /** Aggregate failure message when the listing itself failed. */
+  error?: string
+}
+
+/** Storage migration direction. */
+export type StorageMigrationDirection = 'json-to-pg' | 'pg-to-json'
+
+/**
+ * Conflict policy for a unit the target already holds:
+ * - `skip` (default): target already present → report up-to-date, no writes.
+ * - `overwrite`: clear the target unit's records + global, then import the
+ *   source wholesale. Symmetric — works in both directions.
+ */
+export type StorageConflictPolicy = 'skip' | 'overwrite'
+
+/**
+ * One unit's migration outcome. `skipped` is absent when the unit was
+ * imported; `error` is absent on success.
+ */
+export interface StorageUnitResult {
+  name: string
+  /** Records written (or counted, in dry-run) for this unit. */
+  records: number
+  /** Whether this unit carries a global singleton that was (or would be) migrated. */
+  hasGlobal: boolean
+  /** Why the unit was skipped; absent = imported (or would import). */
+  skipped?: string
+  /** Failure message; absent = success. */
+  error?: string
+  /** Present when the target was rebuilt wholesale (overwrite policy). */
+  overwritten?: boolean
+}
+
+/** `storage.migrate` request body. */
+export interface StorageMigrateRequest {
+  direction: StorageMigrationDirection
+  /** Overrides the settings-stored connection; absent uses the saved config. */
+  config?: PgConnectionConfig
+  /** When true, scan and report without writing anything. */
+  dryRun: boolean
+  /** Conflict handling when the target already holds this unit. Default: 'skip'. */
+  onConflict?: StorageConflictPolicy
+  /**
+   * Only applies to `json-to-pg` migration of the `workspace` unit: writes
+   * the PostgreSQL side's global with `initialized: false` and an empty
+   * `workspaceIds` so the WorkspaceRegistry re-bootstraps `sessionIds` from
+   * the (now-PostgreSQL) session store on next startup. This is how the
+   * "Ungrouped sessions" symptom is actually resolved after migration.
+   * Default: false (preserve the stored global verbatim).
+   */
+  rebootstrap?: boolean
+}
+
+/** `storage.migrate` response: per-unit outcomes plus aggregates. */
+export interface StorageMigrateResult {
+  ok: boolean
+  direction: StorageMigrationDirection
+  dryRun: boolean
+  onConflict: StorageConflictPolicy
+  rebootstrap: boolean
+  units: StorageUnitResult[]
+  /** Sum of records across imported units. */
+  recordsTotal: number
+  /** Total units on the source side (including skipped). */
+  sourceTotal: number
+  /** Aggregate failure message when the run itself failed. */
+  error?: string
 }

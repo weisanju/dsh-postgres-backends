@@ -23,6 +23,10 @@ import {
   type MigrationSessionResult,
   type MigrationStartResult,
   type PgConnectionConfig,
+  type StorageConflictPolicy,
+  type StorageListResult,
+  type StorageMigrateResult,
+  type StorageMigrationDirection,
 } from '../shared.ts'
 import styles from './index.module.css'
 
@@ -360,6 +364,279 @@ export function PgConsoleSection(): ReactNode {
           <MigrationReport report={report} directionLabel={directionLabel} fmtCount={fmtCount} />
         )}
       </div>
+
+      <StorageSection config={config} fmtCount={fmtCount} />
+    </div>
+  )
+}
+
+/** Storage-domain migration section: JSON ⇄ PostgreSQL KV backend. */
+function StorageSection({
+  config,
+  fmtCount,
+}: {
+  config: PgConnectionConfig
+  fmtCount: (n: number) => string
+}): ReactNode {
+  const [list, setList] = useState<StorageListResult | undefined>()
+  const [listError, setListError] = useState<string | undefined>()
+  const [listing, setListing] = useState(false)
+  const [migrating, setMigrating] = useState<StorageMigrationDirection | undefined>()
+  const [report, setReport] = useState<StorageMigrateResult | undefined>()
+  const [migrateError, setMigrateError] = useState<string | undefined>()
+  const [onConflict, setOnConflict] = useState<StorageConflictPolicy>('skip')
+  const [rebootstrap, setRebootstrap] = useState(true)
+  const mounted = useRef(true)
+
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+
+  const refreshList = async (): Promise<void> => {
+    if (listing) return
+    setListing(true)
+    setListError(undefined)
+    try {
+      const result = await call<StorageListResult>('storage.list', { config })
+      if (mounted.current) setList(result)
+    } catch (error) {
+      if (mounted.current) setListError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (mounted.current) setListing(false)
+    }
+  }
+
+  // Refresh once on mount so the comparison table is populated immediately.
+  useEffect(() => { void refreshList() }, [config.host, config.port, config.user, config.database])
+
+  const runMigration = async (direction: StorageMigrationDirection, dryRun: boolean): Promise<void> => {
+    if (migrating !== undefined) return
+    setMigrating(direction)
+    setMigrateError(undefined)
+    setReport(undefined)
+    try {
+      const result = await call<StorageMigrateResult>('storage.migrate', {
+        direction, dryRun, onConflict, rebootstrap, config,
+      })
+      if (mounted.current) setReport(result)
+      // Re-probe both sides after a real (non-dry) migration.
+      if (!dryRun && result.ok) await refreshList()
+    } catch (error) {
+      if (mounted.current) setMigrateError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (mounted.current) setMigrating(undefined)
+    }
+  }
+
+  const directionLabel: Record<StorageMigrationDirection, string> = {
+    'json-to-pg': 'JSON → PostgreSQL',
+    'pg-to-json': 'PostgreSQL → JSON',
+  }
+  const conflictOptions: { value: StorageConflictPolicy; label: string; hint: string }[] = [
+    { value: 'skip', label: '跳过 (skip)', hint: '目标已有该单元 → 不写' },
+    { value: 'overwrite', label: '覆盖 (overwrite)', hint: '清空目标单元（记录+global）后用源重建' },
+  ]
+  const hasWorkspace = list?.units.some((u) => u.name === 'workspace') ?? false
+
+  return (
+    <div className={styles.group}>
+      <div className={styles.groupHeading}>
+        Storage 域迁移
+        <span className={styles.count}>JSON ⇄ PostgreSQL KV（源只读，增量写目标）</span>
+      </div>
+      <p className={styles.desc}>
+        storage-domain 当前路由到 postgres 后端；本区块把 ~/.dsh/storages/*.json 与 PostgreSQL
+        kv_* 表双向迁移。迁移后需重启 dsh 进程读取新数据。源文件不删除，可回退。
+      </p>
+      <div className={styles.actions}>
+        <button className={styles.btn} disabled={listing} onClick={() => void refreshList()}>
+          {listing ? '扫描中…' : '刷新对比'}
+        </button>
+      </div>
+      {listError !== undefined && <p className={`${styles.status} ${styles.err}`}>{listError}</p>}
+      {list !== undefined && !list.ok && list.error !== undefined && (
+        <p className={`${styles.status} ${styles.err}`}>{list.error}</p>
+      )}
+      {list !== undefined && list.ok && (
+        <StorageListTable list={list} fmtCount={fmtCount} />
+      )}
+
+      <div className={styles.row}>
+        <div className={styles.rowText}>
+          <span className={styles.title}>冲突处理</span>
+          <span className={styles.desc}>目标已存在该单元时的行为。默认 skip；overwrite 清空目标后重建。</span>
+        </div>
+        <div className={styles.rowActions}>
+          <label className={styles.selectWrap}>
+            <select
+              className={styles.select}
+              value={onConflict}
+              disabled={migrating !== undefined}
+              onChange={(e) => setOnConflict(e.target.value as StorageConflictPolicy)}
+            >
+              {conflictOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </div>
+      <p className={styles.status}>{conflictOptions.find((o) => o.value === onConflict)?.hint}</p>
+
+      {hasWorkspace && (
+        <div className={styles.row}>
+          <div className={styles.rowText}>
+            <span className={styles.title}>重建 workspace 分组 (rebootstrap)</span>
+            <span className={styles.desc}>
+              仅对 workspace 单元、且方向为 JSON→PG 时生效：写入 global.initialized=false、清空
+              workspaceIds，下次启动时 WorkspaceRegistry 用当前 sessionPersistence（已是 PG
+              会话）重建 sessionIds，修复 “Ungrouped sessions” 问题。
+            </span>
+          </div>
+          <div className={styles.rowActions}>
+            <input
+              type="checkbox"
+              checked={rebootstrap}
+              disabled={migrating !== undefined}
+              onChange={(e) => setRebootstrap(e.target.checked)}
+            />
+          </div>
+        </div>
+      )}
+
+      {(Object.keys(directionLabel) as StorageMigrationDirection[]).map((direction) => (
+        <div key={direction} className={styles.row}>
+          <div className={styles.rowText}>
+            <span className={styles.title}>{directionLabel[direction]}</span>
+            <span className={styles.desc}>扫描源侧全部单元写入目标；源保持不变，可重复执行。</span>
+          </div>
+          <div className={styles.rowActions}>
+            <button
+              className={styles.btn}
+              disabled={migrating !== undefined}
+              onClick={() => void runMigration(direction, true)}
+            >
+              预览 (dry-run)
+            </button>
+            <button
+              className={`${styles.btn} ${styles.primary}`}
+              disabled={migrating !== undefined}
+              onClick={() => void runMigration(direction, false)}
+            >
+              开始迁移
+            </button>
+          </div>
+        </div>
+      ))}
+      {migrating !== undefined && (
+        <p className={styles.status}>正在执行 {directionLabel[migrating]}…（可能耗时较长）</p>
+      )}
+      {migrateError !== undefined && <p className={`${styles.status} ${styles.err}`}>{migrateError}</p>}
+      {report !== undefined && (
+        <StorageMigrateReport report={report} directionLabel={directionLabel} fmtCount={fmtCount} />
+      )}
+    </div>
+  )
+}
+
+/** Side-by-side unit comparison table. */
+function StorageListTable({
+  list,
+  fmtCount,
+}: {
+  list: StorageListResult
+  fmtCount: (n: number) => string
+}): ReactNode {
+  if (list.units.length === 0) {
+    return <p className={styles.status}>两侧均无单元（JSON 目录为空且 PG 无 kv_units 行）。</p>
+  }
+  return (
+    <table className={styles.table}>
+      <thead>
+        <tr>
+          <th className={styles.th}>单元</th>
+          <th className={styles.th}>JSON（文件）</th>
+          <th className={styles.th}>PostgreSQL（kv_*）</th>
+        </tr>
+      </thead>
+      <tbody>
+        {list.units.map((u) => (
+          <tr key={u.name} className={styles.tr}>
+            <td className={styles.td}><code className={styles.code}>{u.name}</code></td>
+            <td className={styles.td}><StorageSideCell side={u.json} fmtCount={fmtCount} /></td>
+            <td className={styles.td}><StorageSideCell side={u.pg} fmtCount={fmtCount} /></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
+/** One side's summary cell. */
+function StorageSideCell({
+  side,
+  fmtCount,
+}: {
+  side: { present: boolean; version?: number; recordCount?: number; hasGlobal?: boolean; error?: string }
+  fmtCount: (n: number) => string
+}): ReactNode {
+  if (side.error !== undefined) {
+    return <span className={styles.err}>读取失败：{side.error}</span>
+  }
+  if (!side.present) return <span className={styles.dim}>—</span>
+  return (
+    <span>
+      v{side.version} · {fmtCount(side.recordCount ?? 0)} 条
+      {side.hasGlobal ? ' · 有 global' : ''}
+    </span>
+  )
+}
+
+/** Storage migration report. */
+function StorageMigrateReport({
+  report,
+  directionLabel,
+  fmtCount,
+}: {
+  report: StorageMigrateResult
+  directionLabel: Record<StorageMigrationDirection, string>
+  fmtCount: (n: number) => string
+}): ReactNode {
+  const failed = report.units.filter((u) => u.error !== undefined)
+  const skipped = report.units.filter((u) => u.skipped !== undefined && u.error === undefined)
+  const imported = report.units.length - skipped.length - failed.length
+  return (
+    <div className={styles.report}>
+      <div className={styles.reportHead}>
+        <span className={styles.title}>
+          {directionLabel[report.direction]} · {report.dryRun ? '预览结果' : '迁移完成'}
+        </span>
+        <span className={styles.count}>
+          {report.dryRun ? '（未写入，仅统计）' : report.ok ? '✓ 完成' : '✗ 有失败'}
+        </span>
+      </div>
+      {report.error !== undefined && <p className={`${styles.status} ${styles.err}`}>{report.error}</p>}
+      <p className={styles.summary}>
+        源共 {fmtCount(report.sourceTotal)} 个单元 · 导入 {fmtCount(imported)} 个 · 记录 {fmtCount(report.recordsTotal)} 条
+        {skipped.length > 0 ? ` · 跳过 ${skipped.length} 个` : ''}
+        {failed.length > 0 ? ` · 失败 ${failed.length} 个` : ''}
+        {report.rebootstrap ? ' · 已对 workspace 设置 rebootstrap' : ''}
+      </p>
+      {(failed.length > 0 || skipped.length > 0) && (
+        <ul className={styles.failList}>
+          {failed.map((u) => (
+            <li key={u.name} className={styles.failItem}>
+              <code className={styles.code}>{u.name}</code>
+              <span className={styles.err}>{u.error}</span>
+            </li>
+          ))}
+          {skipped.map((u) => (
+            <li key={u.name} className={styles.failItem}>
+              <code className={styles.code}>{u.name}</code>
+              <span className={styles.dim}>{u.skipped}</span>
+              {u.overwritten === true && <span className={styles.warn}> · 已整单元重建</span>}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }

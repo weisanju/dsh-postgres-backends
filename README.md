@@ -77,7 +77,10 @@ curl -X POST http://127.0.0.1:3081/pg-console/api/migrate.start \
   -d '{"direction":"jsonl-to-pg","config":{"host":"localhost","port":5432,"user":"postgres","password":"postgres","database":"postgres"},"dryRun":false}'
 ```
 
-> 迁移只**复制**不删除：源保持原样，目标已存在的会话自动跳过（幂等）。迁移期间 PG 后端会分块插入（单事务内 4000 事件/批，规避 PostgreSQL 单条 INSERT 的 65535 绑定参数上限）。
+> 迁移只**复制**不删除：源保持原样。迁移是**事件级增量**的——每次运行读取目标已提交的 seq 长度，只追加源中多出来的后缀（依赖 append 的 contiguity 校验保证 seq 连续无空洞），所以：
+> - 已完全同步的会话标记 *target is up to date*（零写入）
+> - 源在迁移过程中继续增长（如生产实例仍在写 JSONL）时，本次缺的尾部由下一次运行补上（标记 *source changed mid-run*）
+> - 迁移期间 PG 后端会分块插入（单事务内 4000 事件/批，规避 PostgreSQL 单条 INSERT 的 65535 绑定参数上限）
 
 ## 配置项
 

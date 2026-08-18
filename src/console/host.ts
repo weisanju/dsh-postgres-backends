@@ -83,6 +83,8 @@ async function testConnection(ctx: Context, config: PgConnectionConfig): Promise
 interface MigrationEndpoints {
   sourceList: () => Promise<SessionHeader[]>
   sourceRead: (id: SessionId) => Promise<{ meta: SessionHeader; events: SessionEvent[] }>
+  /** Read the target's committed log for one id (fails with 'not found' when absent). */
+  targetRead: (id: SessionId) => Promise<{ meta: SessionHeader; events: SessionEvent[] }>
   targetCreate: (meta: SessionHeader) => Promise<void>
   targetAppend: (id: SessionId, events: SessionEvent[]) => Promise<void>
   close: () => Promise<void>
@@ -103,6 +105,7 @@ async function endpointsFor(
         const { meta, events } = await json.readFrom(id, 0)
         return { meta, events }
       },
+      targetRead: async (id: SessionId) => pg.readFrom(id, 0),
       targetCreate: meta => pg.create(meta),
       targetAppend: (id, events) => pg.append(id, events),
       close: async () => { await pg.close() },
@@ -114,6 +117,7 @@ async function endpointsFor(
       const { meta, events } = await pg.readFrom(id, 0)
       return { meta, events }
     },
+    targetRead: async (id: SessionId) => json.readFrom(id, 0),
     targetCreate: meta => json.create(meta),
     targetAppend: (id, events) => json.append(id, events),
     close: async () => { await pg.close() },
@@ -145,10 +149,30 @@ async function migrate(
         const { meta, events } = await endpoints.sourceRead(header.id)
         session.events = events.length
         if (!dryRun) {
-          await endpoints.targetCreate(meta)
-          await endpoints.targetAppend(meta.id, events)
+          // Event-level incremental migration: never re-create a target that
+          // already holds part of this session. Read the target's committed
+          // length for this id and append only the source suffix past it —
+          // append's contiguity check (seq === cursor) makes the delta safe.
+          // An absent target takes the full log.
+          let targetLen = 0
+          try {
+            const targetLog = await endpoints.targetRead(header.id)
+            targetLen = targetLog.events.length
+          } catch (error) {
+            if (!/not found/.test(error instanceof Error ? error.message : String(error))) throw error
+            // Absent target: full migration below.
+          }
+          const delta = events.slice(targetLen)
+          if (delta.length > 0) {
+            if (targetLen === 0) await endpoints.targetCreate(meta)
+            await endpoints.targetAppend(meta.id, delta)
+          } else {
+            session.skipped = 'target is up to date'
+          }
+          result.eventsTotal += delta.length
+        } else {
+          result.eventsTotal += events.length
         }
-        result.eventsTotal += events.length
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         // A target that already holds this session is an idempotent skip
@@ -156,6 +180,12 @@ async function migrate(
         // a migration after a partial success must not count as an error.
         if (/already has a persisted log on disk/.test(message) || /already exists in this backend/.test(message)) {
           session.skipped = 'target already has this session'
+        } else if (/append seq mismatch/.test(message)) {
+          // The source grew between this session's target-length read and its
+          // append (a live source backend keeps appending). The run is still
+          // authoritative: nothing was written for this session, and a later
+          // run re-reads the longer source and picks up the remainder.
+          session.skipped = 'source changed mid-run; re-run to pick up the tail'
         } else {
           session.error = message
           result.ok = false

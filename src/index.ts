@@ -24,7 +24,7 @@ import {
 } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionEvent, SurfaceEventType, SessionId, SessionHeader, SessionPreparation } from '@deepseek-ai/dsh-session'
 import {
-  DDL, SCHEMA_VERSION, rowToMeta, scanRows, envelopeBindings, escapeNulText,
+  DDL, SCHEMA_VERSION, BATCH_SIZE, rowToMeta, scanRows, eventToBatchEvent, batchEventToEventRow, escapeNulText,
   type EventRow, type SessionRow,
 } from './schema.ts'
 
@@ -148,8 +148,50 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
       await client.query('BEGIN')
       try {
         await client.query(DDL)
-        // Schema v1 → v2: drop the unused `ignorable` column from events.
+        // Schema v1 → v2: drop unused `ignorable` column, migrate to batch storage.
         await client.query('ALTER TABLE events DROP COLUMN IF EXISTS ignorable')
+        // Detect v1 schema (old per-row events table) and migrate to v2 batch format.
+        const hasOldSchema = await client.query<{ exists: boolean }>(
+          `SELECT EXISTS (SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'events' AND column_name = 'seq') AS exists`,
+        )
+        if (hasOldSchema.rows[0]?.exists) {
+          this.ctx.logger.info('[session-persistence-postgres] migrating events table from v1 (per-row) to v2 (batch)')
+          // Create v2 events table alongside the old one.
+          await client.query(`
+            CREATE TABLE events_v2 (
+              session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+              seq_start     INTEGER NOT NULL,
+              seq_end       INTEGER NOT NULL,
+              events_jsonb  JSONB NOT NULL,
+              PRIMARY KEY (session_id, seq_start)
+            )
+          `)
+          // Migrate: batch old rows into v2 format.
+          await client.query(`
+            INSERT INTO events_v2 (session_id, seq_start, seq_end, events_jsonb)
+            SELECT
+              session_id,
+              MIN(seq) AS seq_start,
+              MAX(seq) AS seq_end,
+              jsonb_agg(
+                jsonb_build_object(
+                  'seq', seq,
+                  'type', type,
+                  'time', time,
+                  'data', data,
+                  'sourceEventSeqs', source_event_seqs,
+                  'surfaceOp', surface_op
+                ) ORDER BY seq
+              ) AS events_jsonb
+            FROM events
+            GROUP BY session_id, seq / $1
+          `, [BATCH_SIZE])
+          // Drop old table, rename v2 to events.
+          await client.query('DROP TABLE events CASCADE')
+          await client.query('ALTER TABLE events_v2 RENAME TO events')
+          this.ctx.logger.info('[session-persistence-postgres] v1 → v2 migration complete')
+        }
         const state = await client.query<{ store_id: string; schema_version: number | null }>(
           'SELECT store_id, schema_version FROM persistence_state WHERE singleton = 1',
         )
@@ -164,7 +206,13 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
           if (row.schema_version === null || row.schema_version === 0) {
             throw new Error('session database has an unversioned schema or store identity')
           }
-          if (row.schema_version !== SCHEMA_VERSION) {
+          if (row.schema_version === 1) {
+            // v1 → v2 migration already performed above; update the stored version.
+            await client.query(
+              'UPDATE persistence_state SET schema_version = $1 WHERE singleton = 1',
+              [SCHEMA_VERSION],
+            )
+          } else if (row.schema_version !== SCHEMA_VERSION) {
             throw new Error(
               `session database has schema version ${row.schema_version}, incompatible with this build (${SCHEMA_VERSION})`,
             )
@@ -238,25 +286,9 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
   }
 
   /**
-   * Seek-capable suffix read: PostgreSQL selects `seq >= fromSeq` directly, so
-   * the read scales with the suffix, not the log. Non-mutating.
-   */
-  async loadStoredFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<StoredSuffix | undefined> {
-    await this.guard(signal)
-    const row = await this.rowFor(id)
-    if (row === undefined) return undefined
-    const eventRows = await this.eventRowsFor(id, `seq >= ${fromSeq}`)
-    const { preserved } = scanRows(eventRows, fromSeq)
-    return { meta: rowToMeta(row), events: preserved }
-  }
-
-  /**
    * Durably append a batch in ONE transaction: materialize the sessions row (if
-   * lazy) and INSERT every event, or roll back entirely. The transaction is the
-   * atomicity + durability boundary.
-   *
-   * Events are inserted with a single multi-row `INSERT ... VALUES (...),...`
-   * so a large batch costs one round trip instead of N.
+   * lazy) and INSERT events in batch rows (BATCH_SIZE events per row), or roll
+   * back entirely. The transaction is the atomicity + durability boundary.
    *
    * A foreign-key violation (23503) means the sessions row was deleted
    * out-of-band (with `ON DELETE CASCADE` the events are gone too). We do NOT
@@ -274,30 +306,14 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
       await client.query('BEGIN')
       if (!isMaterialized) await this.writeRow(client, meta)
       if (events.length > 0) {
-        // Multi-row INSERT with 7 bindings per event; the PostgreSQL wire
-        // protocol caps a bind message at 65535 parameters, so a batch with
-        // more than ~9000 events (64k bindings) must be chunked. Chunks stay
-        // inside one transaction: a mid-way failure rolls the whole batch
-        // back, preserving the append-only / contiguous-seq contract.
-        const BINDING_CHUNK = 4000
-        for (let offset = 0; offset < events.length; offset += BINDING_CHUNK) {
-          const chunk = events.slice(offset, offset + BINDING_CHUNK)
-          const rows = chunk.map((_, i) => {
-            const base = i * 7
-            return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb)`
-          }).join(', ')
-          const values: unknown[] = []
-          for (const event of chunk) {
-            const [surfaceSeqs, surfaceOp] = envelopeBindings(event)
-            values.push(
-              meta.id, event.seq, event.type, event.time,
-              JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp,
-            )
-          }
+        for (let i = 0; i < events.length; i += BATCH_SIZE) {
+          const chunk = events.slice(i, i + BATCH_SIZE)
+          const seqStart = chunk[0]!.seq
+          const seqEnd = chunk[chunk.length - 1]!.seq
+          const batchJson = JSON.stringify(chunk.map(eventToBatchEvent))
           await client.query(
-            `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op)
-             VALUES ${rows}`,
-            values,
+            `INSERT INTO events (session_id, seq_start, seq_end, events_jsonb) VALUES ($1, $2, $3, $4::jsonb)`,
+            [meta.id, seqStart, seqEnd, batchJson],
           )
         }
       }
@@ -315,6 +331,9 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
    * Make a crash repair durable in ONE transaction: DELETE the torn tail (from
    * `tornMarker`) and INSERT the synthetic `closers`. After COMMIT the stored
    * rows == the balanced log.
+   *
+   * With batch storage, we delete all batch rows whose seq range intersects
+   * the torn tail, then insert closers as new batch rows.
    */
   async commitRepair(meta: SessionHeader, tornMarker: number | undefined, closers: readonly SessionEvent[]): Promise<void> {
     await this.ready
@@ -322,29 +341,31 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
     try {
       await client.query('BEGIN')
       if (tornMarker !== undefined) {
-        await client.query('DELETE FROM events WHERE session_id = $1 AND seq >= $2', [meta.id, tornMarker])
+        // Delete all batch rows that start at or after tornMarker.
+        // For the row that contains tornMarker, first remove its events >= tornMarker.
+        await client.query(
+          `UPDATE events SET events_jsonb = (
+            SELECT jsonb_agg(e ORDER BY (e->>'seq')::int)
+            FROM jsonb_array_elements(events_jsonb) AS e
+            WHERE (e->>'seq')::int < $1
+          ), seq_end = $1 - 1
+          WHERE session_id = $2 AND seq_start < $1 AND seq_end >= $1`,
+          [tornMarker, meta.id],
+        )
+        // Delete rows that are entirely in the torn tail.
+        await client.query('DELETE FROM events WHERE session_id = $1 AND seq_start >= $2', [meta.id, tornMarker])
       }
       if (closers.length > 0) {
-        // Same NUL-safe JSONB encoding as appendBatch, so synthetic closers can
-        // never hit `22P05 unsupported Unicode escape sequence` if their shape
-        // ever carries user-supplied payload.
-        const rows = closers.map((_, i) => {
-          const base = i * 7
-          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::jsonb, $${base + 6}::jsonb, $${base + 7}::jsonb)`
-        }).join(', ')
-        const values: unknown[] = []
-        for (const event of closers) {
-          const [surfaceSeqs, surfaceOp] = envelopeBindings(event)
-          values.push(
-            meta.id, event.seq, event.type, event.time,
-            JSON.stringify(escapeNulText(event.data)), surfaceSeqs, surfaceOp,
+        for (let i = 0; i < closers.length; i += BATCH_SIZE) {
+          const chunk = closers.slice(i, i + BATCH_SIZE)
+          const seqStart = chunk[0]!.seq
+          const seqEnd = chunk[chunk.length - 1]!.seq
+          const batchJson = JSON.stringify(chunk.map(eventToBatchEvent))
+          await client.query(
+            `INSERT INTO events (session_id, seq_start, seq_end, events_jsonb) VALUES ($1, $2, $3, $4::jsonb)`,
+            [meta.id, seqStart, seqEnd, batchJson],
           )
         }
-        await client.query(
-          `INSERT INTO events (session_id, seq, type, time, data, source_event_seqs, surface_op)
-           VALUES ${rows}`,
-          values,
-        )
       }
       if (tornMarker !== undefined || closers.length > 0) {
         await client.query('UPDATE sessions SET revision = revision + 1 WHERE id = $1', [meta.id])
@@ -410,14 +431,9 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
         await client.query('COMMIT')
         return undefined
       }
-      const eventResult = await client.query<EventRow>(
-        `SELECT seq, type, time, data::text AS data, source_event_seqs::text AS source_event_seqs,
-                surface_op::text AS surface_op
-         FROM events WHERE session_id = $1 ORDER BY seq`,
-        [id],
-      )
+      const eventRows = await this.flattenBatchRows(client, id)
       await client.query('COMMIT')
-      const { preserved, tornFrom } = scanRows(eventResult.rows)
+      const { preserved, tornFrom } = scanRows(eventRows)
       return {
         meta: rowToMeta(row),
         events: preserved,
@@ -450,15 +466,46 @@ export class PostgresSessionPersistence extends SessionPersistence implements Pe
     return result.rows[0]
   }
 
-  /** Fetch one session's event rows, ordered by seq ascending, JSONB cast to text. */
-  private async eventRowsFor(id: SessionId, where = 'TRUE'): Promise<EventRow[]> {
-    const result = await this.pool.query<EventRow>(
-      `SELECT seq, type, time, data::text AS data, source_event_seqs::text AS source_event_seqs,
-              surface_op::text AS surface_op
-       FROM events WHERE session_id = $1 AND ${where} ORDER BY seq`,
+  /**
+   * Flatten all batch rows for a session into EventRow[] (ordered by seq).
+   * Uses the same client so it can be called inside a transaction.
+   */
+  private async flattenBatchRows(client: pg.PoolClient, id: SessionId): Promise<EventRow[]> {
+    const batchResult = await client.query<{ events_jsonb: unknown[] }>(
+      `SELECT events_jsonb FROM events WHERE session_id = $1 ORDER BY seq_start`,
       [id],
     )
-    return result.rows
+    const eventRows: EventRow[] = []
+    for (const br of batchResult.rows) {
+      for (const be of (br.events_jsonb as any[])) {
+        eventRows.push(batchEventToEventRow(be))
+      }
+    }
+    return eventRows
+  }
+
+  /**
+   * Seek-capable suffix read: batch rows whose range intersects `fromSeq` are
+   * selected, then filtered in JS. Scales with the suffix, not the log.
+   */
+  async loadStoredFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<StoredSuffix | undefined> {
+    await this.guard(signal)
+    const row = await this.rowFor(id)
+    if (row === undefined) return undefined
+    const batchResult = await this.pool.query<{ events_jsonb: unknown[] }>(
+      `SELECT events_jsonb FROM events WHERE session_id = $1 AND seq_end >= $2 ORDER BY seq_start`,
+      [id, fromSeq],
+    )
+    const eventRows: EventRow[] = []
+    for (const br of batchResult.rows) {
+      for (const be of (br.events_jsonb as any[])) {
+        if (be.seq >= fromSeq) {
+          eventRows.push(batchEventToEventRow(be))
+        }
+      }
+    }
+    const { preserved } = scanRows(eventRows, fromSeq)
+    return { meta: rowToMeta(row), events: preserved }
   }
 
   /**

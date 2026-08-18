@@ -1,8 +1,7 @@
 /**
  * Schema + load-time helpers for the PostgreSQL session-persistence backend:
- * the DDL (a store-identity row, `sessions` metadata, and a 1:1 `events` row
- * per `SessionEvent`), and the last-`turn/end` cut that gives the PG backend
- * the SAME crash-tail-on-load semantics as the JSONL/SQLite backends.
+ * batch-stored events (multiple events per row via JSONB array) to reduce
+ * row count and primary-key index size.
  *
  * @module dsh-session-persistence-postgres/schema
  */
@@ -14,7 +13,10 @@ import type { SessionEvent, SessionId, SessionHeader, SurfaceOp } from '@deepsee
  * layout; orthogonal to a session's own `version` (which versions the EVENT
  * vocabulary, stored per session in the `sessions` row).
  */
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
+
+/** Events per batch row. */
+export const BATCH_SIZE = 100
 
 /** The SQL schema applied to a fresh database. */
 export const DDL = `
@@ -39,14 +41,11 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE TABLE IF NOT EXISTS events (
-  session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  seq               INTEGER NOT NULL,
-  type              TEXT NOT NULL,
-  time              BIGINT NOT NULL,
-  data              JSONB NOT NULL,
-  source_event_seqs JSONB,
-  surface_op        JSONB,
-  PRIMARY KEY (session_id, seq)
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  seq_start     INTEGER NOT NULL,
+  seq_end       INTEGER NOT NULL,
+  events_jsonb  JSONB NOT NULL,
+  PRIMARY KEY (session_id, seq_start)
 );
 `
 
@@ -67,7 +66,17 @@ export interface SessionRow {
   agent_preset: string | null
 }
 
-/** An `events` table row: one SessionEvent mapped 1:1 (data is JSON). */
+/** One event inside a batch row's `events_jsonb` array. */
+export interface BatchEvent {
+  seq: number
+  type: string
+  time: number
+  data: unknown
+  sourceEventSeqs?: number[]
+  surfaceOp?: SurfaceOp
+}
+
+/** Flattened event row consumed by `scanRows`. */
 export interface EventRow {
   seq: number
   type: string
@@ -79,7 +88,7 @@ export interface EventRow {
   surface_op: string | null
 }
 
-/** pg returns BIGINT as string — normalize to a JS safe integer. */
+/** PG returns BIGINT as string — normalize to a JS safe integer. */
 function toInt(value: unknown): number {
   const n = typeof value === 'string' ? Number(value) : (value as number)
   if (!Number.isSafeInteger(n)) {
@@ -105,7 +114,6 @@ function toInt(value: unknown): number {
  */
 export function escapeNulText(value: unknown): unknown {
   if (typeof value === 'string') {
-    // Fast path: nothing to escape.
     if (!value.includes('\\') && !value.includes('\u0000')) return value
     let out = ''
     for (let i = 0; i < value.length; i++) {
@@ -125,7 +133,6 @@ export function escapeNulText(value: unknown): unknown {
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const [key, item] of Object.entries(value)) {
-      // Keys too: PG text/JSONB reject NUL anywhere, including object keys.
       out[String(escapeNulText(key))] = escapeNulText(item)
     }
     return out
@@ -136,7 +143,6 @@ export function escapeNulText(value: unknown): unknown {
 /** Inverse of {@link escapeNulText} — applied to data parsed back from JSONB. */
 export function unescapeNulText(value: unknown): unknown {
   if (typeof value === 'string') {
-    // Fast path: an escaped NUL or protected literal is always a backslash pair.
     if (!value.includes('\\') && !value.includes('\u0000')) return value
     let out = ''
     for (let i = 0; i < value.length; i++) {
@@ -163,6 +169,43 @@ export function unescapeNulText(value: unknown): unknown {
   }
   return value
 }
+
+// --- Batch <-> EventRow conversion ---
+
+/**
+ * Convert a single SessionEvent into a JSON-serializable object for the batch
+ * array. Envelope fields (sourceEventSeqs, surfaceOp) are included when present.
+ */
+export function eventToBatchEvent(event: SessionEvent): BatchEvent {
+  const se = event as SessionEvent & { surfaceOp?: unknown; sourceEventSeqs?: unknown }
+  const obj: BatchEvent = {
+    seq: event.seq,
+    type: event.type,
+    time: event.time,
+    data: escapeNulText(event.data),
+  }
+  if (se.sourceEventSeqs !== undefined) obj.sourceEventSeqs = se.sourceEventSeqs as number[]
+  if (se.surfaceOp !== undefined) obj.surfaceOp = se.surfaceOp as SurfaceOp
+  return obj
+}
+
+/**
+ * Convert a batch event object (parsed from JSONB) to an EventRow consumed by
+ * scanRows. The `data` field is JSON-stringified so scanRows can parse it back
+ * (mirrors the JSONB::text cast in the old per-row schema).
+ */
+export function batchEventToEventRow(e: BatchEvent): EventRow {
+  return {
+    seq: e.seq,
+    type: e.type,
+    time: e.time,
+    data: JSON.stringify(e.data),
+    source_event_seqs: e.sourceEventSeqs !== undefined ? JSON.stringify(e.sourceEventSeqs) : null,
+    surface_op: e.surfaceOp !== undefined ? JSON.stringify(e.surfaceOp) : null,
+  }
+}
+
+// --- SessionHeader / scanRows (unchanged, kept for reference) ---
 
 /**
  * Reconstruct the SessionHeader from a `sessions` row.
@@ -192,16 +235,13 @@ export function rowToMeta(row: SessionRow): SessionHeader {
  * @returns the reconstructed event.
  */
 export function rowToEvent(row: EventRow): SessionEvent {
-  const surfaceFields = {
-    ...row.source_event_seqs !== null ? { sourceEventSeqs: JSON.parse(row.source_event_seqs) as number[] } : {},
-    ...row.surface_op !== null ? { surfaceOp: JSON.parse(row.surface_op) as SurfaceOp } : {},
-  }
   return {
     type: row.type as SessionEvent['type'],
     seq: toInt(row.seq),
     time: toInt(row.time),
     data: unescapeNulText(JSON.parse(row.data)) as SessionEvent['data'],
-    ...surfaceFields,
+    ...row.source_event_seqs !== null ? { sourceEventSeqs: JSON.parse(row.source_event_seqs) as number[] } : {},
+    ...row.surface_op !== null ? { surfaceOp: JSON.parse(row.surface_op) as SurfaceOp } : {},
   } as SessionEvent
 }
 
@@ -248,16 +288,4 @@ export function scanRows(rows: readonly EventRow[], base = 0): { preserved: Sess
   }
 
   return preserved.length < rows.length ? { preserved, tornFrom: base + preserved.length } : { preserved }
-}
-
-/**
- * Serialize an event's optional envelope fields for PG binding. The surface
- * fields are nullable JSONB — null when the event has no surface metadata.
- */
-export function envelopeBindings(event: SessionEvent): [string | null, string | null] {
-  const se = event as SessionEvent & { surfaceOp?: unknown; sourceEventSeqs?: unknown }
-  return [
-    se.sourceEventSeqs !== undefined ? JSON.stringify(se.sourceEventSeqs) : null,
-    se.surfaceOp !== undefined ? JSON.stringify(se.surfaceOp) : null,
-  ]
 }

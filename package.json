@@ -1,7 +1,7 @@
 {
   "name": "dsh-postgres-backends",
-  "description": "PostgreSQL durable backend family for DeepSeek Harness — session persistence today, more backends (settings, …) to come. Includes a Settings console for connection config and bidirectional session migration (JSONL ⇄ PostgreSQL). Third-party, does not modify the Harness source tree.",
-  "version": "0.1.0-beta.12",
+  "description": "PostgreSQL durable backend family for DeepSeek Harness — session persistence + storage-domain KV backends, both over PostgreSQL. Includes a Settings console for connection config and bidirectional migration (JSONL ⇄ PostgreSQL for sessions; JSON ⇄ PostgreSQL for storage units). Third-party, does not modify the Harness source tree.",
+  "version": "0.1.0-beta.13",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

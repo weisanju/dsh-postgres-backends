@@ -13,9 +13,10 @@
  *   The `PersistenceCoordinator`'s `ctx.effect`/`ctx.on` then register on
  *   the new fiber's `_disposables` rather than the parent fiber.  Call
  *   `fiber.dispose()` (via the returned `dispose` function) to clean up
- *   both the backend resources and the event listeners — without that,
- *   `session/created` events from the parent SessionStore would fire after
- *   the backend is closed.
+ *   both the backend resources and the event listeners.
+ * - The PG backend uses batch storage (BATCH_SIZE=100 events per row via
+ *   `events_jsonb` JSONB array) to reduce row count and index size.  A
+ *   session with 500k events occupies ~5k rows instead of 500k rows.
  * - Migration moves events via the public coordinator surface
  *   (`list`/`readFrom` on the source, `create`+`append` on the target), so
  *   contiguity/validation/versions are enforced by the same code the live

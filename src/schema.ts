@@ -3,6 +3,12 @@
  * batch-stored events (multiple events per row via JSONB array) to reduce
  * row count and primary-key index size.
  *
+ * Schema evolution:
+ *   v1 (initial): per-row events table with columns (session_id, seq, type, time, data, ...)
+ *   v2 (current): batch storage — events (session_id, seq_start, seq_end, events_jsonb)
+ *                 Each row's events_jsonb holds BATCH_SIZE=100 events as a JSONB array.
+ *                 This reduces row count by ~99% and total storage by ~85%.
+ *
  * @module dsh-session-persistence-postgres/schema
  */
 
@@ -18,7 +24,14 @@ export const SCHEMA_VERSION = 2
 /** Events per batch row. */
 export const BATCH_SIZE = 100
 
-/** The SQL schema applied to a fresh database. */
+/** The SQL schema applied to a fresh database.
+ *
+ * events table uses batch storage (BATCH_SIZE=100 events per row) to reduce
+ * row count and primary-key index size.  Each row's `events_jsonb` is a JSONB
+ * array of event objects, ordered by seq.  `seq_start`/`seq_end` are the
+ * range of seq values in the array, used for efficient suffix reads
+ * (`WHERE seq_end >= fromSeq`).
+ */
 export const DDL = `
 CREATE TABLE IF NOT EXISTS persistence_state (
   singleton      INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -41,6 +54,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE TABLE IF NOT EXISTS events (
+  -- Batch-stored events: each row holds BATCH_SIZE=100 events in events_jsonb.
   session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   seq_start     INTEGER NOT NULL,
   seq_end       INTEGER NOT NULL,

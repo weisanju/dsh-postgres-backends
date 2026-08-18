@@ -8,9 +8,14 @@
  * - Both backends are constructed on `ctx.isolate('sessionPersistence')`
  *   child scopes so their `super(ctx, 'sessionPersistence')` registrations
  *   never collide with the mounted runtime backend (or with each other).
- *   Their coordinators install write-path listeners on the child scope,
- *   which receive no events from the parent scope — the isolated instances
- *   are read/write engines only, not a mounted persistence provider.
+ *   They are built via `ctx.plugin()` so the `Fiber` constructor creates a
+ *   child context with its own fiber (`parent.extend({ fiber: this })`).
+ *   The `PersistenceCoordinator`'s `ctx.effect`/`ctx.on` then register on
+ *   the new fiber's `_disposables` rather than the parent fiber.  Call
+ *   `fiber.dispose()` (via the returned `dispose` function) to clean up
+ *   both the backend resources and the event listeners — without that,
+ *   `session/created` events from the parent SessionStore would fire after
+ *   the backend is closed.
  * - Migration moves events via the public coordinator surface
  *   (`list`/`readFrom` on the source, `create`+`append` on the target), so
  *   contiguity/validation/versions are enforced by the same code the live
@@ -38,6 +43,16 @@ import {
   type PgConnectionConfig,
 } from './shared.ts'
 
+/**
+ * Minimal shape of the object returned by `ctx.plugin()` — a cordis `Fiber`
+ * with a `dispose()` method and a child `ctx`.  The actual `Fiber` class is
+ * not exported from Cordis types, so we declare the surface we need.
+ */
+interface DisposableFiber {
+  ctx: Context
+  dispose: () => Promise<void>
+}
+
 /** JSONL document root: the harness-home sessions directory (same as the base bundle default). */
 function jsonlRoot(): string {
   return join(resolveDshHome(), 'sessions')
@@ -64,12 +79,19 @@ function detachLiveSessions(child: Context): void {
   // store through the Proxy. We cannot use `child.provide('sessions', …)`
   // because cordis forbids re-registering a name that is already provided
   // on the parent scope.
+  const boundCache = new Map<PropertyKey, Function>()
   Object.defineProperty(child, 'sessions', {
     value: new Proxy(parentSessions, {
       get(target, prop) {
         if (prop === 'list') return () => []
+        if (boundCache.has(prop)) return boundCache.get(prop)!
         const value = Reflect.get(target, prop)
-        return typeof value === 'function' ? value.bind(target) : value
+        if (typeof value === 'function') {
+          const bound = value.bind(target)
+          boundCache.set(prop, bound)
+          return bound
+        }
+        return value
       },
     }),
     configurable: true,
@@ -78,24 +100,21 @@ function detachLiveSessions(child: Context): void {
   })
 }
 
-/** Build an isolated JSONL backend (never registered on the parent scope). */
-function isolatedJsonlBackend(ctx: Context): JsonlSessionPersistence {
+/** Build an isolated JSONL backend with its own fiber (never registered on the parent scope). */
+async function isolatedJsonlBackend(
+  ctx: Context,
+): Promise<{ jsonl: JsonlSessionPersistence; dispose: () => Promise<void> }> {
   const child = ctx.isolate('sessionPersistence')
   detachLiveSessions(child)
-  return new JsonlSessionPersistence(child, { root: jsonlRoot() })
+  const fiber = await child.plugin(JsonlSessionPersistence, { root: jsonlRoot() })
+  const jsonl = (fiber as unknown as DisposableFiber).ctx.sessionPersistence as JsonlSessionPersistence
+  return {
+    jsonl,
+    dispose: () => (fiber as unknown as DisposableFiber).dispose(),
+  }
 }
 
-/** Build an isolated PG backend from a connection config.
- *
- * Uses `ctx.plugin()` so the `Fiber` constructor creates a child context with
- * its own fiber (`parent.extend({ fiber: this })`).  The
- * `PersistenceCoordinator`'s `ctx.effect`/`ctx.on` then register on the new
- * fiber's `_disposables` rather than the parent fiber.  Call `fiber.dispose()`
- * (via the returned `dispose` function) to clean up both the pool and the
- * event listeners — without that, `session/created` events from the parent
- * SessionStore would fire after the pool is closed and crash with "Cannot use
- * a pool after calling end on the pool".
- */
+/** Build an isolated PG backend from a connection config with its own fiber. */
 async function isolatedPgBackend(
   ctx: Context,
   config: PgConnectionConfig,
@@ -114,10 +133,10 @@ async function isolatedPgBackend(
     poolMax: config.poolMax,
     connectionTimeoutMillis: config.connectionTimeoutMillis,
   })
-  const pg = fiber.ctx.sessionPersistence as PostgresSessionPersistence
+  const pg = (fiber as unknown as DisposableFiber).ctx.sessionPersistence as PostgresSessionPersistence
   return {
     pg,
-    dispose: () => (fiber as any).dispose(),
+    dispose: () => (fiber as unknown as DisposableFiber).dispose(),
   }
 }
 
@@ -171,8 +190,13 @@ async function endpointsFor(
   direction: MigrationDirection,
   config: PgConnectionConfig,
 ): Promise<MigrationEndpoints> {
-  const json = isolatedJsonlBackend(ctx)
-  const { pg, dispose } = await isolatedPgBackend(ctx, config)
+  const { jsonl: json, dispose: disposeJsonl } = await isolatedJsonlBackend(ctx)
+  const { pg, dispose: disposePg } = await isolatedPgBackend(ctx, config)
+
+  async function closeAll(): Promise<void> {
+    await Promise.all([disposeJsonl(), disposePg()])
+  }
+
   if (direction === 'jsonl-to-pg') {
     return {
       sourceList: () => json.list(),
@@ -184,7 +208,7 @@ async function endpointsFor(
       targetCreate: meta => pg.create(meta),
       targetAppend: (id, events) => pg.append(id, events),
       targetReset: async (id) => { await pg.resetSession(id) },
-      close: dispose,
+      close: closeAll,
     }
   }
   return {
@@ -199,7 +223,7 @@ async function endpointsFor(
     targetReset: async () => {
       throw new Error('overwrite is only supported when PostgreSQL is the migration target')
     },
-    close: dispose,
+    close: closeAll,
   }
 }
 
